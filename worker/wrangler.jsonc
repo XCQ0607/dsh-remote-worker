@@ -24,7 +24,10 @@
     "DSH_SESSION_HOURS": "8",
     "DSH_TURN_ENABLED": "true",
     "DSH_TURN_TTL_SECONDS": "300",
-    "DSH_STUN_URLS": "stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:443",
+    "DSH_STUN_ENABLED": "true",
+    "DSH_STUN_USE_CLOUDFLARE": "false",
+    "DSH_STUN_USE_PUBLIC_LIST": "true",
+    "DSH_STUN_URLS": "",
     "DSH_ALLOWED_ORIGINS": "",
     "DSH_DO_LOCATION": ""
   },

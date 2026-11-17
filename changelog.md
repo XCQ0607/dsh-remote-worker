@@ -6,20 +6,33 @@
 
 ## v1.0.1 (2026-11-17)
 
-STUN / TURN 配置行为修正：自定义 STUN 不再被 TURN 覆盖，默认值改为国内可用服务器。
+STUN 配置重构：新增「总开关 + 公共列表 + Cloudflare」三层开关，内置 10 条实测可用的公共 STUN 列表并设为默认。
+
+### 新增
+
+- **STUN 总开关（「启用 STUN」）**：关闭后不下发任何 STUN，**连 Cloudflare TURN 凭据里自带的两条也一并剔除**，客户端只剩 TURN / Relay。此前只能靠清空自定义列表，而 TURN 可用时又会把 Cloudflare 的 STUN 塞回来，等于关不掉。
+- **「启用公共列表 STUN」开关（默认开）**：追加内置公共列表 `PUBLIC_STUN`（`worker/src/stun.ts`），本版共 10 条：
+  - 国内：`stun.miwifi.com:3478`、`stun.chat.bilibili.com:3478`、`stun.hitv.com:3478`、`stun.douyucdn.cn:18000`
+  - 国际：`stun.cloudflare.com:443`、`stun.l.google.com:19302`、`stun1.l.google.com:19302`、`global.stun.twilio.com:3478`、`stun.voip.blackberry.com:3478`、`stun.nextcloud.com:443`
+  - 均在本机国内网络实测能返回 `XOR-MAPPED-ADDRESS`（各 2 次以上）；`stun.cloudflare.com:3478`、`stun.qq.com:3478`、`stun.sipgate.net`、`stunserver.stunprotocol.org`、`stun.syncthing.net`、`stun.ekiga.net`、`stun.ideasip.com`、`stun.bige0.com` 实测不通，未收录。
+- **「启用 Cloudflare STUN」开关（默认关）**：追加 `stun.cloudflare.com` 的 3478 / 443 两条；**只有填了自定义 STUN 才能开启**，否则保存时后端会强制关闭该开关（避免与 TURN 自带的 STUN 重复），后台对应行会显示「未启用」徽章并禁用。
+- **设置页新增「当前实际下发的 STUN（N 条）」预览**：直接展示三层开关解析后的最终列表，以及公共列表全文，改完保存即可对照，不用猜。
+- 新增 `GET /api/v1/admin/settings` 返回字段 `effectiveStun` / `publicStun`。
+- 新增环境变量默认值 `DSH_STUN_ENABLED`（true）、`DSH_STUN_USE_PUBLIC_LIST`（true）、`DSH_STUN_USE_CLOUDFLARE`（false）、`DSH_STUN_URLS`（空）。
 
 ### 修复
 
-- **自定义 STUN 在 TURN 可用时被完全忽略**：此前 `fetchIceServers` 只要 TURN 签发成功就原样返回 Cloudflare 的 `iceServers`，后台「STUN 服务器」填写的地址根本不生效（Cloudflare 只会带上它自己的 `stun:stun.cloudflare.com:3478` 和 `stun:stun.cloudflare.com:443`）。现在自定义 STUN 会合并进返回列表并**排在最前**，客户端优先用你指定的服务器探测直连，TURN 仅作为打洞失败后的中转兜底。
-- **关闭「启用 TURN」时 STUN 也被一起丢掉**：改为 `turnEnabled` 只控制是否签发 TURN 凭据，自定义 STUN 始终下发。
-- **设置项最多 16 条的限制原先在截断前生效**：现在先按 `stun:` / `stuns:` 格式过滤，再截断到 16 条，避免格式错误的行挤占配额。
+- **自定义 STUN 在 TURN 可用时被完全忽略**：旧实现只要 TURN 签发成功就原样返回 Cloudflare 的 `iceServers`，后台填写的地址根本不生效。现在按开关解析后**自定义排最前**，TURN 仅作为打洞失败后的中转兜底。
+- **关闭 TURN 会连带丢掉自定义 STUN**：改为「启用 TURN」只控制是否签发 TURN 凭据，STUN 完全由三个 STUN 开关决定。
+- **TURN 凭据里的 STUN 无法剔除**：新增 `stripStun` / `stripStunFromMixed`，总开关关闭时整条剔除，开启时也只保留被开关认可的地址。
+- **缓存键未包含 STUN 配置**：切换开关后最长 60 秒内仍拿到旧合并结果；现改为 `keyId:ttl:stunUrls`，保存即生效。
+- **设置项 16 条上限原先在格式过滤前生效**：改为先按 `stun:` / `stuns:` 过滤再截断。
 
 ### 优化
 
-- **默认 STUN 改为国内可用组合**：`DSH_STUN_URLS` 默认值从 `stun:stun.cloudflare.com:3478` 改为 `stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:443`。
-  - 实测（本机国内网络，UDP 各 3 次）：`stun.miwifi.com:3478` 3/3、`stun.chat.bilibili.com:3478` 3/3、`stun.hitv.com:3478` 3/3、`stun.douyucdn.cn:18000` 3/3、`stun.cloudflare.com:443` 3/3 均正常；
-  - 而 `stun.cloudflare.com:3478` 与 `stun.qq.com:3478` 在当前网络下 **0/3**（UDP 无应答），这正是原来默认值在国内不好用的原因，因此改用 443 端口那条。
-- **设置页文案**补充说明「每行一个 stun:/stuns: 地址,最多 16 条;会与 Cloudflare 下发的 STUN 合并(自填的排在前面)」，并把「启用 TURN」的提示改为「关闭后不下发 TURN 凭据,只走 P2P / Relay;自定义 STUN 仍会下发」，避免误解。
+- 默认 STUN 从单条 `stun:stun.cloudflare.com:3478` 改为「公共列表全开 + Cloudflare 关闭」，开箱即用且国内可通。
+- 设置页文案补齐：总开关 / 自定义 / 公共列表 / Cloudflare 四项分别说明生效条件与顺序。
+- README 新增「STUN 与 ICE 配置」整节：三个开关的作用与约束、10 条公共列表的来源与实测结论、刻意排除的地址、环境变量默认值、排错建议。
 
 ## v1.0.0 (2026-11-17)
 

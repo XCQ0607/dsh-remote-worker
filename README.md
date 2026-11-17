@@ -202,7 +202,10 @@ cd ../web && npm ci && npm run build
 | `DSH_SESSION_HOURS`           | `8`                             | Web 登录有效期（小时）                                                         |
 | `DSH_TURN_ENABLED`            | `true`                          | 是否启用 TURN                                                                  |
 | `DSH_TURN_TTL_SECONDS`        | `300`                           | 短期 TURN 凭据有效期（秒）                                                     |
-| `DSH_STUN_URLS`               | `stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:443` | STUN 地址（逗号分隔，最多 16 条）；会与 TURN 凭据自带的 STUN 合并，自填的排在前面                                                     |
+| `DSH_STUN_ENABLED`            | `true`                         | STUN 总开关默认值（关闭后不下发任何 STUN）                                    |
+| `DSH_STUN_URLS`               | `""`                         | 自定义 STUN（逗号分隔，最多 16 条），排在下发列表最前                          |
+| `DSH_STUN_USE_PUBLIC_LIST`    | `true`                         | 是否默认叠加内置公共列表（见「STUN 与 ICE 配置」）                            |
+| `DSH_STUN_USE_CLOUDFLARE`     | `false`                        | 是否默认叠加 Cloudflare STUN（需自定义列表非空）                              |
 | `DSH_ALLOWED_ORIGINS`         | `""`                            | 额外允许的 Origin（逗号分隔）                                                  |
 | `DSH_DO_LOCATION`             | `""`                            | Durable Object 区域提示（`apac` / `wnam` / `weur` 等，仅对新建 DO 生效） |
 
@@ -261,6 +264,61 @@ curl -X POST https://你的域名/api/v1/admin/accounts \
 - **管理员账号**（在 `ADMIN_ACCOUNTS` 内）：可查看概览、跨账号设备管理（踢下线/吊销）、多账号增删改密、实时连接断开、**TURN 中转**（一键调用 Cloudflare API 创建 Key / 手动填入 / 测试签发）、**系统设置**（实时修改参数并支持恢复环境变量默认值）、审计日志。
 - **普通账号**：登录后仅可查看自己账号下的设备状态。
 - **TURN 配置**：Cloudflare Realtime TURN 每月提供 **1,000 GB** 免费流量。在后台「TURN 中转」页面支持三种配置方式：一键调用 Cloudflare API 创建、手动填入已有 Key ID + API Token，或通过 `wrangler secret` 注入。未配置 TURN 时自动退化为 Relay-only（经 Durable Object 转发密文）。
+
+## STUN 与 ICE 配置
+
+客户端建立 WebRTC 连接前，会先向服务端索取 ICE 服务器列表（`GET /api/v1/turn/credentials`）。服务端按**三个开关**组合出最终列表，开关都在后台「系统设置」页，保存即时生效。
+
+### 三个开关
+
+| 开关 | 作用 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| 启用 STUN | 总开关 | 开 | **关闭后不下发任何 STUN**，连 Cloudflare TURN 凭据里自带的两条也一并剔除，客户端只剩 TURN / Relay |
+| 自定义 STUN | 手工填写的地址 | 空 | 每行一个 `stun:` / `stuns:` 地址，最多 16 条；开启总开关时下发，**排在最前** |
+| 启用公共列表 STUN | 追加内置公共列表 | 开 | 追加下方 10 条公共 STUN |
+| 启用 Cloudflare STUN | 追加 `stun.cloudflare.com` | 关 | 追加 3478 / 443 两条；**需先填写自定义 STUN 才能开启**，否则保存时会被强制关闭 |
+
+最终下发顺序固定为：**自定义 → 公共列表 → Cloudflare**，同名地址去重（不区分大小写）。
+
+> 为什么「启用 Cloudflare STUN」要有前置条件：Cloudflare TURN 凭据本身就会带上它的 STUN，若你没有自定义地址又打开这个开关，只会产生重复条目，所以设了这个约束。
+
+### 内置公共 STUN 列表（`worker/src/stun.ts` 的 `PUBLIC_STUN`）
+
+以下 10 条为本项目默认值，均已在本机国内网络下实测能返回 `XOR-MAPPED-ADDRESS`（各 2 次以上）：
+
+| # | 地址 | 归属 | 备注 |
+| :-: | --- | --- | --- |
+| 1 | `stun:stun.miwifi.com:3478` | 小米 | 国内，延迟低 |
+| 2 | `stun:stun.chat.bilibili.com:3478` | 哔哩哔哩 | 国内 |
+| 3 | `stun:stun.hitv.com:3478` | 芒果 TV | 国内 |
+| 4 | `stun:stun.douyucdn.cn:18000` | 斗鱼 | 国内，非标准端口 |
+| 5 | `stun:stun.cloudflare.com:443` | Cloudflare | 443 端口，穿透严格防火墙 |
+| 6 | `stun:stun.l.google.com:19302` | Google | 标准公共 STUN |
+| 7 | `stun:stun1.l.google.com:19302` | Google | 上一条的备用节点 |
+| 8 | `stun:global.stun.twilio.com:3478` | Twilio | 国际大厂 |
+| 9 | `stun:stun.voip.blackberry.com:3478` | BlackBerry | 长期稳定 |
+| 10 | `stun:stun.nextcloud.com:443` | Nextcloud | 443 端口 |
+
+刻意**没有**收录的地址（实测不可用，供参考）：`stun.cloudflare.com:3478` 在某些国内网络下 UDP 无应答、`stun.qq.com:3478`、`stun.sipgate.net:3478`、`stunserver.stunprotocol.org:3478`、`stun.syncthing.net:3478`、`stun.ekiga.net:3478`、`stun.ideasip.com:3478`、`stun.bige0.com:3478`。
+
+要增删这个列表，直接改 `worker/src/stun.ts` 里的 `PUBLIC_STUN` 数组即可，无需改前端；保持精简（建议 ≤ 12 条），避免 ICE 收集阶段无谓等待。
+
+### 环境变量默认值
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DSH_STUN_ENABLED` | `true` | STUN 总开关默认值 |
+| `DSH_STUN_URLS` | `""` | 自定义 STUN，逗号分隔 |
+| `DSH_STUN_USE_PUBLIC_LIST` | `true` | 是否默认叠加公共列表 |
+| `DSH_STUN_USE_CLOUDFLARE` | `false` | 是否默认叠加 Cloudflare STUN（受自定义列表非空约束） |
+
+后台保存过的值优先级更高；点「恢复环境变量默认值」可回到上面这套。
+
+### 排错
+
+- **设置页底部会显示「当前实际下发的 STUN（N 条）」**，改完开关保存后直接对照，不用猜。
+- STUN 只负责探测公网地址，**不中转流量**。对称型 NAT / UDP 被封时，真正兜底的是 TURN。
+- 若某条 STUN 在你网络下不可用，浏览器 ICE 收集会等约 1–2 秒超时才继续，所以列表不是越长越好。
 
 ## 界面预览
 

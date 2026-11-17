@@ -9,6 +9,7 @@ import {
 import { ApiError, Store, normEmail, type SavedDevice } from './store.js'
 import { equal, hash } from './crypto.js'
 import { createTurnKey, fetchIceServers, listTurnKeys, type CfAuth, type TurnKey } from './ice.js'
+import { PUBLIC_STUN, resolveStunUrls } from './stun.js'
 import { defaultSettings, sanitize, type Settings } from './settings.js'
 
 export interface Env {
@@ -272,8 +273,8 @@ export class Hub extends DurableObject<Env> {
       const cid = url.searchParams.get('connection_id') ?? ''
       if (!cid || cid.length > 128) throw new ApiError('INVALID_MESSAGE')
       if (!this.authorizeIce(source.descriptor.deviceId, cid)) throw new ApiError('CONNECTION_NOT_FOUND', 404)
-      // turnEnabled 只控制是否签发 TURN 凭据;自定义 STUN 始终下发,便于国内网络优先尝试直连。
-      const { servers } = await fetchIceServers(this.turnOn ? this.turn : undefined, this.cfg.turnTtlSeconds, this.cfg.stunUrls)
+      // turnEnabled 只控制是否签发 TURN 凭据;STUN 由 stunEnabled / stunUsePublicList / stunUseCloudflare 三个开关解析。
+      const { servers } = await fetchIceServers(this.turnOn ? this.turn : undefined, this.cfg.turnTtlSeconds, resolveStunUrls(this.cfg))
       return json(200, { iceServers: servers })
     }
     if (method === 'GET' && path === '/api/v1/devices') {
@@ -344,7 +345,7 @@ export class Hub extends DurableObject<Env> {
       })
     }
     if (p === '/settings') {
-      if (method === 'GET') return json(200, { settings: this.cfg, defaults: defaultSettings(this.env) })
+      if (method === 'GET') return json(200, { settings: this.cfg, defaults: defaultSettings(this.env), publicStun: PUBLIC_STUN, effectiveStun: resolveStunUrls(this.cfg) })
       if (method === 'PUT') {
         await this.applySettings(sanitize(await this.body(req) as Record<string, unknown>, this.cfg))
         await this.log('settings.update', '', actor)
@@ -435,7 +436,7 @@ export class Hub extends DurableObject<Env> {
       catch (e) { return json(502, { error: { code: 'CLOUDFLARE_API_ERROR', message: String(e instanceof Error ? e.message : e).slice(0, 300), retryable: false } }) }
     }
     if (method === 'POST' && p === '/turn/test') {
-      const r = await fetchIceServers(this.turn, this.cfg.turnTtlSeconds, this.cfg.stunUrls, true)
+      const r = await fetchIceServers(this.turnOn ? this.turn : undefined, this.cfg.turnTtlSeconds, resolveStunUrls(this.cfg), true)
       return json(200, { turn: r.turn, error: r.error ?? null, servers: r.servers.map(s => ({ urls: s.urls, hasCredential: Boolean(s.credential) })) })
     }
     throw new ApiError('METHOD_NOT_FOUND', 404)

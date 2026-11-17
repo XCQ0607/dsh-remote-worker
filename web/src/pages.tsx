@@ -203,7 +203,7 @@ export function Turn() {
   </>)
 }
 
-const FIELDS: { key: string; label: string; hint: string; type: 'num' | 'bool' | 'text' | 'list' }[] = [
+const FIELDS: { key: string; label: string; hint: string; type: 'num' | 'bool' | 'text' | 'list'; needs?: string }[] = [
   { key: 'siteName', label: '站点名称', hint: '显示在后台标题', type: 'text' },
   { key: 'sessionHours', label: '后台登录有效期(小时)', hint: '1–720', type: 'num' },
   { key: 'heartbeatMs', label: '心跳间隔(ms)', hint: '服务端 ping 周期,5000–120000', type: 'num' },
@@ -214,7 +214,10 @@ const FIELDS: { key: string; label: string; hint: string; type: 'num' | 'bool' |
   { key: 'maxDevicesPerAccount', label: '每账号设备上限', hint: '1–4096', type: 'num' },
   { key: 'turnEnabled', label: '启用 TURN', hint: '关闭后不下发 TURN 凭据,只走 P2P / Relay;自定义 STUN 仍会下发', type: 'bool' },
   { key: 'turnTtlSeconds', label: 'TURN 凭据有效期(秒)', hint: '60–3600', type: 'num' },
-  { key: 'stunUrls', label: 'STUN 服务器', hint: '每行一个 stun:/stuns: 地址,最多 16 条;会与 Cloudflare 下发的 STUN 合并(自填的排在前面)。清空则只用 TURN 凭据自带的 STUN', type: 'list' },
+  { key: 'stunEnabled', label: '启用 STUN', hint: '总开关。关闭后不下发任何 STUN(包括 TURN 凭据自带的),只剩 TURN / Relay', type: 'bool' },
+  { key: 'stunUrls', label: '自定义 STUN', hint: '每行一个 stun:/stuns: 地址,最多 16 条;开启总开关时下发,排在最前面', type: 'list' },
+  { key: 'stunUsePublicList', label: '启用公共列表 STUN', hint: '附加内置公共 STUN(国内 + 国际,含 443/19302 端口),共 10 条', type: 'bool', needs: 'stunEnabled' },
+  { key: 'stunUseCloudflare', label: '启用 Cloudflare STUN', hint: '附加 stun.cloudflare.com 的 3478 / 443;需先填写自定义 STUN 才能开启', type: 'bool', needs: 'stunEnabled' },
   { key: 'allowedOrigins', label: '额外允许的 Origin', hint: '每行一个,如 https://dsh.example.com;自定义域名 Origin 与访问域名相同时无需填写', type: 'list' },
 ]
 
@@ -226,17 +229,24 @@ export function SettingsPage() {
   if (!s) return null
   const val = (k: string, t: string) => t === 'list' ? (s[k] ?? []).join('\n') : s[k]
   const onChange = (k: string, t: string, v: any) => setS({ ...s, [k]: t === 'num' ? Number(v) : t === 'list' ? String(v).split('\n') : v })
+  const locked = (f: { key: string; needs?: string }) => Boolean(f.needs && !s[f.needs])
+  const effective: string[] = d?.effectiveStun ?? []
+  const publicStun: string[] = d?.publicStun ?? []
   const save = async (body: any) => { try { await api('/api/v1/admin/settings', { method: 'PUT', body }); toast('s', '设置已生效'); reload() } catch (e: any) { toast('e', e.message) } }
   return (<>
     <Head title="系统设置" sub="默认值来自 wrangler.jsonc 的 vars(DSH_*);此处保存的值优先,实时生效(心跳间隔对新连接生效)">
       <button className="btn" onClick={() => save(d.defaults)}>恢复环境变量默认值</button><button className="btn pri" onClick={() => save(s)}><Save size={15} />保存</button></Head>
     <div className="card"><div className="form2">
-      {FIELDS.map(f => <div className="field" key={f.key}><label>{f.label}</label>
-        {f.type === 'bool' ? <button className={`toggle ${s[f.key] ? 'on' : ''}`} onClick={() => onChange(f.key, 'bool', !s[f.key])} />
-          : f.type === 'list' ? <textarea rows={3} value={val(f.key, f.type)} onChange={e => onChange(f.key, f.type, e.target.value)} />
+      {FIELDS.map(f => <div className="field" key={f.key}><label>{f.label}{locked(f) && <span className="badge warn" style={{ marginLeft: 8 }}><i />未启用</span>}</label>
+        {f.type === 'bool' ? <button className={`toggle ${s[f.key] && !locked(f) ? 'on' : ''}`} disabled={locked(f)} onClick={() => onChange(f.key, 'bool', !s[f.key])} />
+          : f.type === 'list' ? <textarea rows={4} value={val(f.key, f.type)} disabled={!s.stunEnabled} onChange={e => onChange(f.key, f.type, e.target.value)} />
           : <input type={f.type === 'num' ? 'number' : 'text'} value={val(f.key, f.type)} onChange={e => onChange(f.key, f.type, e.target.value)} />}
-        <p className="hint">{f.hint}</p></div>)}
+        <p className="hint">{f.hint}{f.key === 'stunUseCloudflare' && !s.stunUrls?.filter(Boolean).length ? ';当前未填写自定义 STUN,该开关会被强制关闭' : ''}</p></div>)}
     </div></div>
+    <div className="card"><h3><Cloud size={15} />当前实际下发的 STUN({effective.length} 条)</h3>
+      {effective.length ? <pre className="mono" style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{effective.join('\n')}</pre>
+        : <p className="hint">STUN 总开关已关闭,客户端只会拿到 TURN / Relay。</p>}
+      <p className="hint" style={{ marginTop: 10 }}>公共列表({publicStun.length} 条,打开「启用公共列表 STUN」后追加):</p>
+      <pre className="mono" style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', opacity: .8 }}>{publicStun.join('\n')}</pre></div>
   </>)
 }
-

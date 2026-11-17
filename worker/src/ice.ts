@@ -26,11 +26,12 @@ export const listTurnKeys = (auth: CfAuth, accountId: string) =>
 
 let cached: { key: string; expiresAt: number; servers: IceServer[] } | undefined
 
-/** 判断 TURN 返回的条目是否就是同一组 STUN,避免同一批地址重复下发。 */
 const urlsOf = (s: IceServer): string[] => (Array.isArray(s.urls) ? s.urls : [s.urls])
-const isSameStunEntry = (a: IceServer, b: IceServer): boolean => {
-  const x = new Set(urlsOf(a).map(u => u.trim().toLowerCase())), y = urlsOf(b).map(u => u.trim().toLowerCase())
-  return y.length > 0 && y.every(u => x.has(u))
+/** 从 TURN 返回的条目里剔除 STUN 地址;条目若混合了 turn: 地址则只保留 TURN 部分。 */
+const stripStun = (s: IceServer): IceServer | undefined => {
+  const keep = urlsOf(s).filter(u => !/^stuns?:/i.test(u))
+  if (!keep.length) return undefined
+  return { ...s, urls: keep.length === 1 ? keep[0]! : keep }
 }
 
 export async function fetchIceServers(
@@ -39,11 +40,13 @@ export async function fetchIceServers(
   stunUrls: string[],
   noCache = false,
 ): Promise<{ servers: IceServer[]; turn: boolean; error?: string }> {
-  // 自定义 STUN(后台「STUN 服务器」)始终排在最前:即使 TURN 可用也一并下发,
-  // 这样国内网络可以用自建/国内 STUN 先探测直连,TURN 只作为打洞失败后的中转兜底。
+  // stunUrls 由 resolveStunUrls 按三个开关解析完成(自定义 / 公共列表 / Cloudflare);
+  // 为空表示 STUN 总开关关闭,此时连 TURN 凭据自带的 STUN 也要剔除。
   const stun: IceServer[] = stunUrls.length ? [{ urls: stunUrls }] : []
+  const wanted = new Set(stunUrls.map(u => u.trim().toLowerCase()))
   if (!turn) return { servers: stun, turn: false }
-  const cacheKey = `${turn.keyId}:${ttl}`
+  // STUN 配置参与缓存键:后台切换开关后立即生效,不会拿到上一次合并结果的缓存。
+  const cacheKey = `${turn.keyId}:${ttl}:${stunUrls.join(',')}`
   const now = Date.now()
   if (!noCache && cached && cached.key === cacheKey && cached.expiresAt > now) {
     return { servers: cached.servers, turn: true }
@@ -59,8 +62,12 @@ export async function fetchIceServers(
     const data = await res.json() as { iceServers?: IceServer[] | IceServer }
     const list = Array.isArray(data.iceServers) ? data.iceServers : data.iceServers ? [data.iceServers] : []
     if (!list.length) return { servers: stun, turn: false, error: 'empty response' }
-    // Cloudflare 返回的 iceServers 自带 Cloudflare 的 STUN;自定义 STUN 合并去重后放在前面优先尝试。
-    const merged = stun.length ? [stun[0]!, ...list.filter(s => !isSameStunEntry(s, stun[0]!))] : list
+    // Cloudflare 的 iceServers 自带它的 STUN:总开关关闭时整条剔除;开启时也交给 resolveStunUrls 决定是否保留,
+    // 避免「我关了 Cloudflare STUN 却在 TURN 条目里又被塞回来」。
+    const cleaned = list
+      .map(s => (stun.length ? stripStunFromMixed(s, wanted) : stripStun(s)))
+      .filter((s): s is IceServer => s !== undefined)
+    const merged = stun.length ? [stun[0]!, ...cleaned] : cleaned
     // Reuse credentials for at most half the TTL (capped at 60s) so clients always get >= 240s validity
     cached = { key: cacheKey, expiresAt: now + Math.min(60, Math.floor(ttl / 2)) * 1000, servers: merged }
     return { servers: merged, turn: true }
@@ -68,4 +75,10 @@ export async function fetchIceServers(
     console.error('turn_credentials_failed', String(e))
     return { servers: stun, turn: false, error: String(e) }
   }
+}
+/** 保留条目中仍被 wanted 认可的 STUN 地址,其余 URL 原样保留。 */
+function stripStunFromMixed(s: IceServer, wanted: Set<string>): IceServer | undefined {
+  const keep = urlsOf(s).filter(u => !/^stuns?:/i.test(u) || wanted.has(u.trim().toLowerCase()))
+  if (!keep.length) return undefined
+  return { ...s, urls: keep.length === 1 ? keep[0]! : keep }
 }

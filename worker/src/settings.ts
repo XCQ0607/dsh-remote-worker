@@ -9,7 +9,14 @@ export interface Settings {
   sessionHours: number
   turnEnabled: boolean
   turnTtlSeconds: number
+  /** STUN 总开关:关闭后不下发任何 STUN(包括 TURN 凭据自带的)。 */
+  stunEnabled: boolean
+  /** 自定义 STUN 列表。 */
   stunUrls: string[]
+  /** 是否附带 Cloudflare STUN;仅在已配置自定义 STUN 时可开启。 */
+  stunUseCloudflare: boolean
+  /** 是否附带内置公共 STUN 列表(PUBLIC_STUN)。 */
+  stunUsePublicList: boolean
   siteName: string
   allowedOrigins: string[]
 }
@@ -32,10 +39,12 @@ export function defaultSettings(env: EnvLike): Settings {
     heartbeatMs: env.DSH_HEARTBEAT_MS, helloTimeoutMs: env.DSH_HELLO_TIMEOUT_MS, heartbeatDisconnectMs: env.DSH_HEARTBEAT_DISCONNECT_MS,
     maxFramesPerSec: env.DSH_MAX_FRAMES_PER_SEC, maxConnections: env.DSH_MAX_CONNECTIONS, maxDevicesPerAccount: env.DSH_MAX_DEVICES_PER_ACCOUNT,
     sessionHours: env.DSH_SESSION_HOURS, turnEnabled: env.DSH_TURN_ENABLED !== 'false', turnTtlSeconds: env.TURN_TTL_SECONDS ?? env.DSH_TURN_TTL_SECONDS,
-    stunUrls: env.DSH_STUN_URLS ?? 'stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:443', siteName: env.DSH_SITE_NAME ?? 'DSH Remote', allowedOrigins: env.DSH_ALLOWED_ORIGINS ?? '',
+    stunEnabled: env.DSH_STUN_ENABLED, stunUseCloudflare: env.DSH_STUN_USE_CLOUDFLARE, stunUsePublicList: env.DSH_STUN_USE_PUBLIC_LIST,
+    stunUrls: env.DSH_STUN_URLS ?? '', siteName: env.DSH_SITE_NAME ?? 'DSH Remote', allowedOrigins: env.DSH_ALLOWED_ORIGINS ?? '',
   }, {
     heartbeatMs: 25_000, helloTimeoutMs: 5000, heartbeatDisconnectMs: 75_000, maxFramesPerSec: 512, maxConnections: 256,
-    maxDevicesPerAccount: 256, sessionHours: 8, turnEnabled: true, turnTtlSeconds: 300, stunUrls: [], siteName: 'DSH Remote', allowedOrigins: [],
+    maxDevicesPerAccount: 256, sessionHours: 8, turnEnabled: true, turnTtlSeconds: 300,
+    stunEnabled: true, stunUseCloudflare: false, stunUsePublicList: true, stunUrls: [], siteName: 'DSH Remote', allowedOrigins: [],
   })
 }
 
@@ -45,8 +54,13 @@ export function sanitize(input: Record<string, unknown>, base: Settings): Settin
   if (s.heartbeatDisconnectMs < s.heartbeatMs * 2) s.heartbeatDisconnectMs = s.heartbeatMs * 3
   s.turnEnabled = input.turnEnabled === undefined ? base.turnEnabled : input.turnEnabled === true || input.turnEnabled === 'true'
   s.stunUrls = input.stunUrls === undefined ? base.stunUrls : list(input.stunUrls).filter(u => /^stuns?:[^\s]+$/i.test(u))
+  const flag = (k: 'stunEnabled' | 'stunUseCloudflare' | 'stunUsePublicList', dflt: boolean): boolean =>
+    input[k] === undefined ? dflt : input[k] === true || input[k] === 'true'
+  s.stunEnabled = flag('stunEnabled', base.stunEnabled)
+  s.stunUsePublicList = flag('stunUsePublicList', base.stunUsePublicList)
+  // Cloudflare STUN 只是「额外的容错来源」,没有自定义地址时开启会与公共列表 / TURN 自带重复,因此强制关闭。
+  s.stunUseCloudflare = flag('stunUseCloudflare', base.stunUseCloudflare) && s.stunUrls.length > 0
   s.allowedOrigins = input.allowedOrigins === undefined ? base.allowedOrigins : list(input.allowedOrigins).filter(o => /^https?:\/\/[^\s/]+$/i.test(o))
   s.siteName = typeof input.siteName === 'string' && input.siteName.trim() ? input.siteName.trim().slice(0, 40) : base.siteName
   return s
 }
-
