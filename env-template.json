@@ -1,0 +1,37 @@
+{
+  "_说明": "复制本文件为 env.json 后填写，再运行 node scripts/deploy.mjs。以 _ 开头的字段为注释，脚本会自动忽略。",
+  "_认证方式": "三选一：1) 填 CLOUDFLARE_API_TOKEN；2) 填 CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY；3) 全留空则使用已登录的 wrangler login (OAuth)。",
+
+  "CLOUDFLARE_API_TOKEN": "",
+  "_CLOUDFLARE_API_TOKEN": "推荐：Scoped API Token（需 Workers Scripts:Edit、Account Settings:Read、Calls/Realtime:Edit）",
+
+  "CLOUDFLARE_EMAIL": "",
+  "CLOUDFLARE_API_KEY": "",
+  "_CLOUDFLARE_API_KEY": "可选：Cloudflare Global API Key（需与 CLOUDFLARE_EMAIL 成对填写，可自动创建 TURN）",
+
+  "CLOUDFLARE_ACCOUNT_ID": "",
+  "_CLOUDFLARE_ACCOUNT_ID": "可选：32位 Account ID；当登录邮箱下有多个 Account 时必须填写",
+
+  "WORKER_NAME": "dsh-remote",
+  "_WORKER_NAME": "Worker 服务名称（决定默认 *.workers.dev 二级域名）",
+
+  "DSH_ACCOUNT": "admin@example.com",
+  "DSH_PASSWORD": "change-this-password-min-12",
+  "_DSH_ACCOUNT_说明": "首个管理员账号邮箱与密码（密码至少12位），脚本会自动将其加入 ADMIN_ACCOUNTS 并创建账号",
+
+  "ADMIN_TOKEN": "",
+  "_ADMIN_TOKEN": "可选：管理员 API 密钥（至少16位）；留空则首次部署自动随机生成并回填",
+
+  "TURN_KEY_ID": "",
+  "TURN_KEY_API_TOKEN": "",
+  "_TURN_KEY_说明": "可选：已有 Cloudflare TURN Key ID 与 API Token；填入后直接绑定，不会重复创建。留空且自动创建成功后会自动回填到 env.json",
+
+  "SKIP_TURN": "0",
+  "_SKIP_TURN": "设为 1 则跳过自动创建 Cloudflare TURN Key（仅用 Relay 中转）",
+
+  "FORCE_TURN": "0",
+  "_FORCE_TURN": "设为 1 则即使已配置过 TURN_KEY_ID 也强制重新创建新的 TURN Key",
+
+  "DSH_DO_LOCATION": "",
+  "_DSH_DO_LOCATION": "可选：Durable Object 区域提示（如 apac / wnam / enam / weur / eeur / oc），仅对新建 DO 实例生效"
+}
