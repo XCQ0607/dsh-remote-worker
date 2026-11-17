@@ -60,7 +60,14 @@ function oauthHeaders() {
 }
 
 step(1, 'install dependencies & build dashboard')
-run('npm', ['ci'], { cwd: worker }); run('npm', ['ci'], { cwd: web }); run('npm', ['run', 'build'], { cwd: web })
+run('npm', ['ci'], { cwd: worker })
+if (existsSync(join(web, 'package.json'))) {
+  run('npm', ['ci'], { cwd: web }); run('npm', ['run', 'build'], { cwd: web })
+} else if (existsSync(join(worker, 'public', 'index.html'))) {
+  console.log('  web/ 源码不在包内,直接使用预构建的 worker/public 前端产物')
+} else {
+  throw new Error('缺少 web/ 源码且 worker/public 未构建,请改用 -source.zip 完整源码包')
+}
 
 step(2, 'resolve Cloudflare account')
 let acct = env.CLOUDFLARE_ACCOUNT_ID

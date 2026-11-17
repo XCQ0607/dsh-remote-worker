@@ -36,6 +36,61 @@ Worker (worker/src/index.ts)          ← 无状态路由 + 安全响应头 + �
 
 ---
 
+## 方式零：下载 Release 发布包部署（无需构建）
+
+每次发布都会在 [Releases](https://github.com/XCQ0607/dsh-remote-worker/releases) 提供两个压缩包和一份校验和：
+
+| 资产                                        | 内容                                                                                                     | 适用场景                                   |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `dsh-remote-worker-vX.Y.Z.zip`            | **预构建可部署包**：`worker/`（含已构建好的 `public/` 前端产物）、`scripts/deploy.mjs`、`env-template.json`、README、LICENSE、changelog | 只想尽快跑起来，不关心前端源码             |
+| `dsh-remote-worker-vX.Y.Z-source.zip`     | **完整源码包**：在上面的基础上追加 `web/` 前端源码与 `.github/` 工作流                                       | 想改前端、自己发版或提交 PR                |
+| `SHA256SUMS.txt`                           | 上面两个 zip 的 SHA-256 校验和                                                                            | 下载后核对完整性                           |
+
+### 1. 下载并解压
+
+在仓库 **Releases** 页面下载对应 zip，解压后进入目录（下文以 `dsh-remote-worker-v1.0.0` 为例）：
+
+```bash
+# 可选：核对校验和
+sha256sum -c SHA256SUMS.txt
+```
+
+解压后的目录结构：
+
+```
+dsh-remote-worker-v1.0.0/
+├── worker/            # Worker 源码 + 已构建的 public/ 前端（wrangler.jsonc 在此）
+├── scripts/deploy.mjs # 一键部署脚本
+├── env-template.json  # 配置模板，复制为 env.json 后填写
+├── package.json
+└── README.md / LICENSE / changelog.md
+```
+
+### 2. 复制配置模板并填写
+
+```bash
+cp env-template.json env.json
+```
+
+最少需要填写 `CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY`（或 `CLOUDFLARE_API_TOKEN`）、`CLOUDFLARE_ACCOUNT_ID`、`DSH_ACCOUNT`、`DSH_PASSWORD`，字段含义见下方变量表。
+
+### 3. 安装依赖并部署
+
+```bash
+cd worker && npm ci && cd ..
+node scripts/deploy.mjs
+```
+
+脚本会自动部署 Worker、写入 `ADMIN_TOKEN` 与 TURN secrets、创建首个管理员账号，并把结果写到 `deploy-output.json`。前端已随包构建好，**不需要再执行 `npm run build`**。
+
+> 发布包里的 `worker/public/` 就是该版本对应的前端产物；若你改了 `web/src` 下的代码，需要回到完整源码包重新 `npm --prefix web run build`。
+
+### 4. 绑定自定义域名
+
+部署完成后按 [手动部署的第 6 步](#6-绑定自定义域名) 在 Cloudflare 控制台为 Worker 添加 Custom Domain。
+
+---
+
 ## 方式一：一键脚本部署（推荐）
 
 脚本 `scripts/deploy.mjs` 会自动完成：安装依赖、构建前端、解析账户 ID、部署 Worker、写入 `ADMIN_TOKEN` 与 TURN secrets、创建首个管理员账号，并生成 `deploy-output.json`（已 gitignore）。

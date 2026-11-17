@@ -1,0 +1,247 @@
+name: Build and Release
+
+# 版本号来源：根目录 package.json 的 version（自动补 v 前缀）
+# 触发方式：
+#   1. 推送 v* 标签（例如 v1.0.0）
+#   2. 手动 workflow_dispatch；默认分支上运行即「重新发布 / 覆盖发布」
+# 覆盖发布：publish 阶段先 `gh release delete <tag> --yes --cleanup-tag` 再重建，同名版本可重复执行。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '可选：覆盖 package.json 的版本号（如 1.0.0，留空则读取 package.json）'
+        required: false
+        default: ''
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: dsh-remote-worker
+
+jobs:
+  # ── 1. 初始化：读取版本号 / 生成本版 Release 说明 / 汇总贡献者 ────────────────
+  init:
+    name: Init (version / notes / contributors)
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 版本号读取：package.json 是唯一事实来源；手填输入优先；统一输出 vX.Y.Z
+      - name: Read version from package.json
+        id: version
+        run: |
+          RAW="${{ inputs.version }}"
+          if [ -z "$RAW" ]; then RAW="$(node -p "require('./package.json').version")"; fi
+          VERSION="v${RAW#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: ${VERSION}"
+
+      # 从根目录 changelog.md 截取最上面的 ## v… 小节作为 Release 说明
+      - name: Extract release notes from changelog.md
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          if ! grep -q "^## ${VERSION}" changelog.md; then
+            echo "::warning::changelog.md 中没有 ${VERSION} 小节，回退为取最新一节"
+          fi
+          awk '/^## v/ {if (p) exit; p=1} p' changelog.md \
+            | sed '/<!--/,/-->/d' \
+            | awk 'NF {last=NR} {line[NR]=$0} END {for (i=1;i<=last;i++) print line[i]}' > notes.md
+          echo "----- release notes -----"
+          cat notes.md
+
+      # 贡献者：优先「上一个标签..本次提交」的作者，否则取仓库 contributors 列表
+      - name: Collect contributors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PREV="$(git describe --tags --abbrev=0 "${{ github.sha }}^0" 2>/dev/null || true)"
+          LIST=""
+          if [ -n "$PREV" ]; then
+            echo "Previous tag: $PREV"
+            LIST="$(gh api "repos/${{ github.repository }}/compare/${PREV}...${{ github.sha }}" \
+              --jq '.commits[].author.login // empty' 2>/dev/null | sort -u | grep -v '\[bot\]$' || true)"
+          fi
+          if [ -z "$LIST" ]; then
+            LIST="$(gh api "repos/${{ github.repository }}/contributors?per_page=100" \
+              --jq '.[] | select(.type == "User") | .login' 2>/dev/null | sort -u || true)"
+          fi
+          if [ -z "$LIST" ]; then
+            LIST="${{ github.repository_owner }}"
+            echo "No contributor resolved, fallback to repo owner"
+          fi
+          {
+            echo ""
+            echo "### 👥 本次发布的贡献者"
+            echo ""
+            printf '%s\n' "$LIST" | sed 's/^/- @/'
+            echo ""
+            echo "<a href=\"https://github.com/${{ github.repository }}/graphs/contributors\">"
+            echo "  <img src=\"https://contrib.rocks/image?repo=${{ github.repository }}\" alt=\"contributors\" />"
+            echo "</a>"
+            echo ""
+            echo "---"
+            echo "*由 ${{ github.actor }} 通过 GitHub Actions 构建 · $(date -u '+%Y-%m-%d %H:%M UTC')*"
+          } >> notes.md
+          echo "----- contributors -----"
+          echo "$LIST"
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: notes.md
+          retention-days: 7
+
+  # ── 2. 构建与打包：类型检查 + 前端构建 + wrangler dry-run + 两个 zip ──────────
+  build:
+    name: Build & Package
+    needs: init
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install worker deps
+        working-directory: worker
+        run: npm ci --no-audit --no-fund
+
+      - name: Install web deps
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck worker
+        working-directory: worker
+        run: npm run typecheck
+
+      - name: Build dashboard (tsc + vite -> worker/public)
+        working-directory: web
+        run: npm run build
+
+      - name: Dry-run deploy validation
+        working-directory: worker
+        run: npx wrangler deploy --dry-run --outdir .dryrun
+
+      # 组装发布包：dist = 预构建可直接部署；source = 完整源码
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.init.outputs.VERSION }}"
+          NAME="${{ env.PROJECT }}"
+          EXCLUDES=(--exclude '.git' --exclude 'node_modules' --exclude '.wrangler' --exclude '.dev.vars'
+                    --exclude 'env.json' --exclude 'deploy-output.json' --exclude 'sources' --exclude 'dev'
+                    --exclude '.dryrun' --exclude '*.zip' --exclude '.DS_Store')
+
+          rm -rf stage out
+          mkdir -p "stage/${NAME}-${VERSION}"
+
+          # 1) 可部署包：worker（含已构建的 public）+ 一键部署脚本 + 模板与文档
+          rsync -a "${EXCLUDES[@]}" worker "stage/${NAME}-${VERSION}/"
+          mkdir -p "stage/${NAME}-${VERSION}/scripts"
+          cp scripts/deploy.mjs "stage/${NAME}-${VERSION}/scripts/"
+          cp package.json env-template.json README.md LICENSE changelog.md "stage/${NAME}-${VERSION}/"
+
+          # 2) 完整源码包：在上面的基础上再加 web/ 前端源码与 .github 工作流
+          rsync -a "stage/${NAME}-${VERSION}/" "stage/${NAME}-${VERSION}-src/"
+          rsync -a "${EXCLUDES[@]}" web "stage/${NAME}-${VERSION}-src/"
+          rsync -a "${EXCLUDES[@]}" .github "stage/${NAME}-${VERSION}-src/"
+
+          mkdir -p out
+          (cd stage && zip -qr "../out/${NAME}-${VERSION}.zip" "${NAME}-${VERSION}")
+          (cd stage && zip -qr "../out/${NAME}-${VERSION}-source.zip" "${NAME}-${VERSION}-src")
+
+          (cd out && sha256sum ./*.zip > SHA256SUMS.txt)
+
+          echo "----- assets -----"
+          ls -lh out
+          echo "----- deploy zip layout -----"
+          unzip -l "out/${NAME}-${VERSION}.zip" | head -30
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: out/*
+          retention-days: 7
+
+  # ── 3. 发布：先删除同名 Release（覆盖发布），再创建带资产的 Release ──────────
+  publish:
+    name: Publish Release
+    needs: [init, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Show assets
+        run: ls -l release_assets
+
+      # 覆盖发布：删除已存在的同名 Release 与标签，保证重复执行不会 422
+      - name: Delete existing release (overwrite)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.init.outputs.VERSION }}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，删除后覆盖发布"
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+            sleep 5
+          else
+            echo "No existing release for $TAG"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.init.outputs.VERSION }}
+          name: DSH Remote Worker ${{ needs.init.outputs.VERSION }}
+          body_path: release_assets/notes.md
+          files: |
+            release_assets/*.zip
+            release_assets/SHA256SUMS.txt
+          draft: false
+          prerelease: false
+          make_latest: true
+          generate_release_notes: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Released ${{ needs.init.outputs.VERSION }}"
+            echo ""
+            echo "| 资产 | 说明 |"
+            echo "| --- | --- |"
+            echo "| \`${{ env.PROJECT }}-${{ needs.init.outputs.VERSION }}.zip\` | 预构建可部署包（worker + 一键部署脚本）|"
+            echo "| \`${{ env.PROJECT }}-${{ needs.init.outputs.VERSION }}-source.zip\` | 完整源码包（含 web/ 源码与 CI 工作流）|"
+            echo "| \`SHA256SUMS.txt\` | 校验和 |"
+          } >> "$GITHUB_STEP_SUMMARY"
