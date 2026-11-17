@@ -43,7 +43,7 @@ export function Overview() {
           <button className="btn sm right" onClick={testTurn}><CheckCircle2 size={14} />测试签发</button></div>
         <p className="hint">{d.turn.keyId ? `Key: ${d.turn.keyId}` : '前往「TURN 中转」页一键创建 Cloudflare TURN Key。'}</p></div>
       <div className="card"><h3>运行参数与免费额度</h3>
-        <p className="hint" style={{ fontSize: 13 }}>心跳 {Math.round((d.config?.heartbeatMs ?? 25000) / 1000)}s · WS 上限 {d.config?.maxConnections ?? 256} · TURN TTL {d.config?.turnTtlSeconds ?? 300}s</p>
+        <p className="hint" style={{ fontSize: 13 }}>P2P {d.config?.p2pEnabled === false ? '关' : '开'} · STUN {d.config?.stunEnabled === false ? '关' : '开'} · 心跳 {Math.round((d.config?.heartbeatMs ?? 25000) / 1000)}s · WS 上限 {d.config?.maxConnections ?? 256} · TURN TTL {d.config?.turnTtlSeconds ?? 300}s</p>
         <p className="hint" style={{ fontSize: 13 }}>Workers 免费版每日 10 万请求、DO 13,000 GB-s，启用 Hibernation 空闲不计时。</p>
         <div className="bar"><div style={{ width: `${Math.min(100, d.sockets * 4)}%` }} /></div></div>
     </div>
@@ -203,50 +203,162 @@ export function Turn() {
   </>)
 }
 
-const FIELDS: { key: string; label: string; hint: string; type: 'num' | 'bool' | 'text' | 'list'; needs?: string }[] = [
+const FIELDS: { key: string; label: string; hint: string; type: 'num' | 'bool' | 'text' }[] = [
   { key: 'siteName', label: '站点名称', hint: '显示在后台标题', type: 'text' },
   { key: 'sessionHours', label: '后台登录有效期(小时)', hint: '1–720', type: 'num' },
-  { key: 'heartbeatMs', label: '心跳间隔(ms)', hint: '服务端 ping 周期,5000–120000', type: 'num' },
-  { key: 'heartbeatDisconnectMs', label: '心跳断线阈值(ms)', hint: '超过该时间无 pong 则断开,需 ≥ 2×心跳', type: 'num' },
+  { key: 'p2pEnabled', label: '打开 P2P', hint: '默认开启。允许设备间协商 WebRTC P2P 直连；关闭后仅走 TURN / Relay', type: 'bool' },
+  { key: 'stunEnabled', label: '打开 STUN', hint: '默认开启。用于 P2P NAT 打洞，关闭后不下发任何 STUN（含 TURN 凭据自带的）', type: 'bool' },
+  { key: 'turnEnabled', label: '启用 TURN', hint: '默认开启。P2P 打洞失败时签发 Cloudflare TURN 中继凭据', type: 'bool' },
+  { key: 'turnTtlSeconds', label: 'TURN 凭据有效期(秒)', hint: '60–3600', type: 'num' },
+  { key: 'heartbeatMs', label: '心跳间隔(ms)', hint: '服务端 ping 周期，5000–120000', type: 'num' },
+  { key: 'heartbeatDisconnectMs', label: '心跳断线阈值(ms)', hint: '超过该时间无 pong 则断开，需 ≥ 2×心跳', type: 'num' },
   { key: 'helloTimeoutMs', label: 'Hello 握手超时(ms)', hint: '连接后必须在此时间内认证', type: 'num' },
   { key: 'maxFramesPerSec', label: '单连接每秒帧数上限', hint: '超限返回 RATE_LIMITED', type: 'num' },
   { key: 'maxConnections', label: 'WebSocket 并发上限', hint: '8–1024', type: 'num' },
   { key: 'maxDevicesPerAccount', label: '每账号设备上限', hint: '1–4096', type: 'num' },
-  { key: 'turnEnabled', label: '启用 TURN', hint: '关闭后不下发 TURN 凭据,只走 P2P / Relay;自定义 STUN 仍会下发', type: 'bool' },
-  { key: 'turnTtlSeconds', label: 'TURN 凭据有效期(秒)', hint: '60–3600', type: 'num' },
-  { key: 'stunEnabled', label: '启用 STUN', hint: '总开关。关闭后不下发任何 STUN(包括 TURN 凭据自带的),只剩 TURN / Relay', type: 'bool' },
-  { key: 'stunUrls', label: '自定义 STUN', hint: '每行一个 stun:/stuns: 地址,最多 16 条;开启总开关时下发,排在最前面', type: 'list' },
-  { key: 'stunUsePublicList', label: '启用公共列表 STUN', hint: '附加内置公共 STUN(国内 + 国际,含 443/19302 端口),共 10 条', type: 'bool', needs: 'stunEnabled' },
-  { key: 'stunUseCloudflare', label: '启用 Cloudflare STUN', hint: '附加 stun.cloudflare.com 的 3478 / 443;需先填写自定义 STUN 才能开启', type: 'bool', needs: 'stunEnabled' },
-  { key: 'allowedOrigins', label: '额外允许的 Origin', hint: '每行一个,如 https://dsh.example.com;自定义域名 Origin 与访问域名相同时无需填写', type: 'list' },
 ]
 
 export function SettingsPage() {
   const [d, reload] = useData<any>('/api/v1/admin/settings')
   const toast = useToast()
   const [s, setS] = useState<any>(null)
+  const [stunUrl, setStunUrl] = useState(''), [stunLabel, setStunLabel] = useState('')
+  const [stunFilter, setStunFilter] = useState<'all' | 'on' | 'off'>('all')
+  const [originInput, setOriginInput] = useState('')
   useEffect(() => { if (d) setS(d.settings) }, [d])
   if (!s) return null
-  const val = (k: string, t: string) => t === 'list' ? (s[k] ?? []).join('\n') : s[k]
-  const onChange = (k: string, t: string, v: any) => setS({ ...s, [k]: t === 'num' ? Number(v) : t === 'list' ? String(v).split('\n') : v })
-  const locked = (f: { key: string; needs?: string }) => Boolean(f.needs && !s[f.needs])
-  const effective: string[] = d?.effectiveStun ?? []
-  const publicStun: string[] = d?.publicStun ?? []
-  const save = async (body: any) => { try { await api('/api/v1/admin/settings', { method: 'PUT', body }); toast('s', '设置已生效'); reload() } catch (e: any) { toast('e', e.message) } }
+
+  const onChange = (k: string, t: string, v: any) => setS({ ...s, [k]: t === 'num' ? Number(v) : v })
+  const save = async (body: any) => {
+    try {
+      const r = await api<any>('/api/v1/admin/settings', { method: 'PUT', body })
+      if (r.settings) setS(r.settings)
+      toast('s', '设置已生效')
+      reload()
+    } catch (e: any) { toast('e', e.message) }
+  }
+
+  const stuns: any[] = s.stunServers ?? []
+  const enabledStunCount = stuns.filter(x => x.enabled).length
+  const filteredStuns = stuns
+    .map((x, idx) => ({ ...x, idx }))
+    .filter(x => stunFilter === 'all' || (stunFilter === 'on' ? x.enabled : !x.enabled))
+
+  const addStun = () => {
+    const url = stunUrl.trim()
+    if (!/^stuns?:[^\s]+$/i.test(url)) { toast('e', '请输入有效的 stun: 或 stuns: 地址'); return }
+    if (stuns.some(x => x.url.toLowerCase() === url.toLowerCase())) { toast('e', '该 STUN 地址已存在'); return }
+    if (stuns.length >= 64) { toast('e', '最多保留 64 条 STUN'); return }
+    setS({ ...s, stunServers: [{ url, label: stunLabel.trim() || '自定义', region: '自定义', enabled: true }, ...stuns] })
+    setStunUrl(''); setStunLabel('')
+  }
+  const toggleStun = (idx: number) => setS({ ...s, stunServers: stuns.map((x, i) => i === idx ? { ...x, enabled: !x.enabled } : x) })
+  const delStun = (idx: number) => setS({ ...s, stunServers: stuns.filter((_, i) => i !== idx) })
+  const setAllStun = (enabled: boolean) => setS({ ...s, stunServers: stuns.map(x => ({ ...x, enabled })) })
+  const resetStunList = () => setS({ ...s, stunServers: d?.defaultStun ?? d?.defaults?.stunServers ?? [] })
+
+  const origins: { origin: string; enabled: boolean }[] = s.originRules ?? []
+  const addOrigin = () => {
+    const origin = originInput.trim().replace(/\/+$/, '')
+    if (!/^https?:\/\/[^\s/]+$/i.test(origin)) { toast('e', '请输入合法的 Origin（如 https://dsh.example.com）'); return }
+    if (origins.some(x => x.origin.toLowerCase() === origin.toLowerCase())) { toast('e', '该 Origin 已存在'); return }
+    if (origins.length >= 32) { toast('e', '最多保留 32 条 Origin'); return }
+    setS({ ...s, originRules: [...origins, { origin, enabled: true }] })
+    setOriginInput('')
+  }
+  const toggleOrigin = (idx: number) => setS({ ...s, originRules: origins.map((x, i) => i === idx ? { ...x, enabled: !x.enabled } : x) })
+  const delOrigin = (idx: number) => setS({ ...s, originRules: origins.filter((_, i) => i !== idx) })
+
   return (<>
-    <Head title="系统设置" sub="默认值来自 wrangler.jsonc 的 vars(DSH_*);此处保存的值优先,实时生效(心跳间隔对新连接生效)">
-      <button className="btn" onClick={() => save(d.defaults)}>恢复环境变量默认值</button><button className="btn pri" onClick={() => save(s)}><Save size={15} />保存</button></Head>
-    <div className="card"><div className="form2">
-      {FIELDS.map(f => <div className="field" key={f.key}><label>{f.label}{locked(f) && <span className="badge warn" style={{ marginLeft: 8 }}><i />未启用</span>}</label>
-        {f.type === 'bool' ? <button className={`toggle ${s[f.key] && !locked(f) ? 'on' : ''}`} disabled={locked(f)} onClick={() => onChange(f.key, 'bool', !s[f.key])} />
-          : f.type === 'list' ? <textarea rows={4} value={val(f.key, f.type)} disabled={!s.stunEnabled} onChange={e => onChange(f.key, f.type, e.target.value)} />
-          : <input type={f.type === 'num' ? 'number' : 'text'} value={val(f.key, f.type)} onChange={e => onChange(f.key, f.type, e.target.value)} />}
-        <p className="hint">{f.hint}{f.key === 'stunUseCloudflare' && !s.stunUrls?.filter(Boolean).length ? ';当前未填写自定义 STUN,该开关会被强制关闭' : ''}</p></div>)}
-    </div></div>
-    <div className="card"><h3><Cloud size={15} />当前实际下发的 STUN({effective.length} 条)</h3>
-      {effective.length ? <pre className="mono" style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{effective.join('\n')}</pre>
-        : <p className="hint">STUN 总开关已关闭,客户端只会拿到 TURN / Relay。</p>}
-      <p className="hint" style={{ marginTop: 10 }}>公共列表({publicStun.length} 条,打开「启用公共列表 STUN」后追加):</p>
-      <pre className="mono" style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', opacity: .8 }}>{publicStun.join('\n')}</pre></div>
+    <Head title="系统设置" sub="默认值来自 wrangler.jsonc 的 vars(DSH_*);修改后点右上角「保存」即时生效">
+      <button className="btn" onClick={() => save(d.defaults)}>恢复环境变量默认值</button>
+      <button className="btn pri" onClick={() => save(s)}><Save size={15} />保存</button>
+    </Head>
+
+    <div className="card" style={{ marginBottom: 16 }}>
+      <h3>基础与传输开关</h3>
+      <div className="form2">
+        {FIELDS.map(f => <div className="field" key={f.key}><label>{f.label}</label>
+          {f.type === 'bool' ? <button className={`toggle ${s[f.key] ? 'on' : ''}`} onClick={() => onChange(f.key, 'bool', !s[f.key])} />
+            : <input type={f.type === 'num' ? 'number' : 'text'} value={s[f.key] ?? ''} onChange={e => onChange(f.key, f.type, e.target.value)} />}
+          <p className="hint">{f.hint}</p></div>)}
+      </div>
+    </div>
+
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="row" style={{ marginBottom: 6 }}>
+        <h3 style={{ margin: 0 }}><Cloud size={15} />公共与自定义 STUN 列表（用于 P2P 打洞）</h3>
+        <span className={`badge ${s.stunEnabled ? 'ok' : 'warn'}`}><i />{s.stunEnabled ? `已启用 ${enabledStunCount} / ${stuns.length}` : 'STUN 总开关已关闭'}</span>
+      </div>
+      <p className="hint" style={{ marginBottom: 10 }}>
+        STUN 仅用于 WebRTC <strong>P2P</strong> 建连阶段的 NAT 公网地址探测（不中转流量）；打洞失败后将由 TURN 或 Relay 接管。支持在下方卡片单独启用、禁用、删除或新增。
+      </p>
+      <div className="add-bar">
+        <input placeholder="新增 STUN 地址，如 stun:stun.miwifi.com:3478" value={stunUrl} onChange={e => setStunUrl(e.target.value)} onKeyDown={e => e.key === 'Enter' && addStun()} />
+        <input className="short" placeholder="备注（可选）" value={stunLabel} onChange={e => setStunLabel(e.target.value)} onKeyDown={e => e.key === 'Enter' && addStun()} />
+        <button className="btn pri" onClick={addStun}><Plus size={15} />添加</button>
+      </div>
+      <div className="row" style={{ marginTop: 12 }}>
+        <div className="seg">
+          {(['all', 'on', 'off'] as const).map(k => (
+            <button key={k} className={`btn sm ${stunFilter === k ? 'pri' : ''}`} onClick={() => setStunFilter(k)}>
+              {k === 'all' ? `全部 (${stuns.length})` : k === 'on' ? `已启用 (${enabledStunCount})` : `已禁用 (${stuns.length - enabledStunCount})`}
+            </button>
+          ))}
+        </div>
+        <div className="row right">
+          <button className="btn sm" onClick={() => setAllStun(true)}>全部启用</button>
+          <button className="btn sm" onClick={() => setAllStun(false)}>全部禁用</button>
+          <button className="btn sm" onClick={resetStunList}>恢复默认列表</button>
+        </div>
+      </div>
+      {filteredStuns.length ? (
+        <div className="srv-grid">
+          {filteredStuns.map(item => (
+            <div key={item.url} className={`srv-card ${item.enabled && s.stunEnabled ? '' : 'off'}`}>
+              <div className="srv-top">
+                <div className="srv-title">
+                  <span>{item.label || (item.builtin ? '公共 STUN' : '自定义')}</span>
+                  <span className={`badge ${item.builtin ? '' : 'ok'}`}>{item.region || (item.builtin ? '内置' : '自定义')}</span>
+                </div>
+                <div className="srv-actions">
+                  <button className={`toggle ${item.enabled ? 'on' : ''}`} title={item.enabled ? '点击禁用' : '点击启用'} onClick={() => toggleStun(item.idx)} />
+                  <button className="icon-btn" title="删除" onClick={() => delStun(item.idx)}><Trash2 size={14} /></button>
+                </div>
+              </div>
+              <div className="srv-url">{item.url}</div>
+            </div>
+          ))}
+        </div>
+      ) : <div className="empty">暂无 STUN 服务器，可在上方添加或点击「恢复默认列表」</div>}
+    </div>
+
+    <div className="card">
+      <div className="row" style={{ marginBottom: 6 }}>
+        <h3 style={{ margin: 0 }}>额外允许的 Origin 白名单</h3>
+        <span className="badge"><i />已启用 {origins.filter(x => x.enabled).length} / {origins.length}</span>
+      </div>
+      <p className="hint" style={{ marginBottom: 10 }}>自定义域名与访问域名相同时无需填写；仅在需要额外允许跨域 Origin 访问时添加（如 https://dsh.example.com）。</p>
+      <div className="add-bar">
+        <input placeholder="输入 Origin，如 https://dsh.example.com" value={originInput} onChange={e => setOriginInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && addOrigin()} />
+        <button className="btn pri" onClick={addOrigin}><Plus size={15} />添加</button>
+      </div>
+      {origins.length ? (
+        <div className="srv-grid">
+          {origins.map((item, idx) => (
+            <div key={item.origin} className={`srv-card ${item.enabled ? '' : 'off'}`}>
+              <div className="srv-top">
+                <span className={`badge ${item.enabled ? 'ok' : ''}`}><i />{item.enabled ? '已启用' : '已禁用'}</span>
+                <div className="srv-actions">
+                  <button className={`toggle ${item.enabled ? 'on' : ''}`} title={item.enabled ? '点击禁用' : '点击启用'} onClick={() => toggleOrigin(idx)} />
+                  <button className="icon-btn" title="删除" onClick={() => delOrigin(idx)}><Trash2 size={14} /></button>
+                </div>
+              </div>
+              <div className="srv-url">{item.origin}</div>
+            </div>
+          ))}
+        </div>
+      ) : <div className="empty" style={{ padding: '18px 0 6px' }}>未配置额外 Origin（默认仅允许同源访问）</div>}
+    </div>
   </>)
 }

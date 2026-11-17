@@ -1,51 +1,49 @@
-/** STUN 相关常量与解析:自定义 / Cloudflare / 公共列表三层,由后台三个开关控制。 */
-import type { Settings } from './settings.js'
+/** 公共 STUN 列表与解析：用于 WebRTC P2P NAT 穿透（仅探测公网映射地址，不中转流量）。 */
+export interface StunServer {
+  url: string
+  label?: string
+  region?: string
+  enabled: boolean
+  builtin?: boolean
+}
 
-/** Cloudflare Realtime TURN 凭据里自带的 STUN,固定就这两条。 */
-export const CLOUDFLARE_STUN = ['stun:stun.cloudflare.com:3478', 'stun:stun.cloudflare.com:443'] as const
+export const PUBLIC_STUN: readonly Omit<StunServer, 'enabled' | 'builtin'>[] = [
+  // 国内（亚太低延迟优先）
+  { url: 'stun:stun.miwifi.com:3478', label: '小米', region: '国内' },
+  { url: 'stun:stun.chat.bilibili.com:3478', label: '哔哩哔哩', region: '国内' },
+  { url: 'stun:stun.hitv.com:3478', label: '芒果 TV', region: '国内' },
+  { url: 'stun:stun.douyucdn.cn:18000', label: '斗鱼', region: '国内' },
+  { url: 'stun:stun.qq.com:3478', label: '腾讯', region: '国内' },
+  // Cloudflare
+  { url: 'stun:stun.cloudflare.com:443', label: 'Cloudflare 443', region: '全球' },
+  { url: 'stun:stun.cloudflare.com:3478', label: 'Cloudflare 3478', region: '全球' },
+  // 国际公共 STUN
+  { url: 'stun:stun.l.google.com:19302', label: 'Google', region: '国际' },
+  { url: 'stun:stun1.l.google.com:19302', label: 'Google 1', region: '国际' },
+  { url: 'stun:stun2.l.google.com:19302', label: 'Google 2', region: '国际' },
+  { url: 'stun:stun3.l.google.com:19302', label: 'Google 3', region: '国际' },
+  { url: 'stun:stun4.l.google.com:19302', label: 'Google 4', region: '国际' },
+  { url: 'stun:global.stun.twilio.com:3478', label: 'Twilio', region: '国际' },
+  { url: 'stun:stun.voip.blackberry.com:3478', label: 'BlackBerry', region: '国际' },
+  { url: 'stun:stun.nextcloud.com:443', label: 'Nextcloud', region: '国际' },
+  { url: 'stun:stun.syncthing.net:3478', label: 'Syncthing', region: '国际' },
+  { url: 'stun:stun.sipgate.net:3478', label: 'Sipgate', region: '欧洲' },
+  { url: 'stun:stunserver.stunprotocol.org:3478', label: 'StunProtocol', region: '国际' },
+]
 
-/**
- * 内置公共 STUN 列表。
- * 挑选标准:各至少实测 2 次能返回 XOR-MAPPED-ADDRESS,且覆盖不同供应商与端口(3478 / 443 / 18000 / 19302),
- * 便于在 UDP 被干扰或 3478 被封的网络里仍有可用项。国内四项优先,便于亚太用户。
- * 维护说明:如某项长期不可用,直接在此删除;列表保持精简(建议 ≤ 12 条),避免 ICE 收集阶段无谓等待。
- */
-export const PUBLIC_STUN = [
-  // 国内(实测可用)
-  'stun:stun.miwifi.com:3478',
-  'stun:stun.chat.bilibili.com:3478',
-  'stun:stun.hitv.com:3478',
-  'stun:stun.douyucdn.cn:18000',
-  // 国际大厂
-  'stun:stun.cloudflare.com:443',
-  'stun:stun.l.google.com:19302',
-  'stun:stun1.l.google.com:19302',
-  'stun:global.stun.twilio.com:3478',
-  'stun:stun.voip.blackberry.com:3478',
-  // 443 端口,穿透严格防火墙
-  'stun:stun.nextcloud.com:443',
-] as const
+export const defaultStunServers = (enabled = true): StunServer[] =>
+  PUBLIC_STUN.map(s => ({ ...s, enabled, builtin: true }))
 
-const norm = (u: string) => u.trim().toLowerCase()
-
-/**
- * 计算真正下发给客户端的 STUN 列表(去重,保序):
- *   1. 自定义(后台填写 / DSH_STUN_URLS)
- *   2. 公共列表(开关打开时,见 PUBLIC_STUN)
- *   3. Cloudflare STUN(开关打开时;要求已配置自定义,否则强制关闭)
- * 总开关关闭时一律返回空数组,连 TURN 凭据自带的 STUN 也会被剔除。
- */
-export function resolveStunUrls(cfg: Pick<Settings, 'stunEnabled' | 'stunUrls' | 'stunUseCloudflare' | 'stunUsePublicList'>): string[] {
+export function resolveStunUrls(cfg: { stunEnabled: boolean; stunServers: readonly StunServer[] }): string[] {
   if (!cfg.stunEnabled) return []
-  const out: string[] = []
   const seen = new Set<string>()
-  const push = (u: string) => {
-    const k = norm(u)
-    if (!k || seen.has(k)) return
-    seen.add(k); out.push(u.trim())
+  const out: string[] = []
+  for (const s of cfg.stunServers) {
+    if (!s.enabled) continue
+    const k = s.url.trim().toLowerCase()
+    if (!k || seen.has(k)) continue
+    seen.add(k)
+    out.push(s.url.trim())
   }
-  for (const u of cfg.stunUrls) push(u)
-  if (cfg.stunUsePublicList) for (const u of PUBLIC_STUN) push(u)
-  if (cfg.stunUseCloudflare) for (const u of CLOUDFLARE_STUN) push(u)
   return out
 }

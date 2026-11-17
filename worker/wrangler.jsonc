@@ -22,11 +22,10 @@
     "DSH_MAX_CONNECTIONS": "256",
     "DSH_MAX_DEVICES_PER_ACCOUNT": "256",
     "DSH_SESSION_HOURS": "8",
+    "DSH_P2P_ENABLED": "true",
     "DSH_TURN_ENABLED": "true",
     "DSH_TURN_TTL_SECONDS": "300",
     "DSH_STUN_ENABLED": "true",
-    "DSH_STUN_USE_CLOUDFLARE": "false",
-    "DSH_STUN_USE_PUBLIC_LIST": "true",
     "DSH_STUN_URLS": "",
     "DSH_ALLOWED_ORIGINS": "",
     "DSH_DO_LOCATION": ""

@@ -9,7 +9,7 @@ import {
 import { ApiError, Store, normEmail, type SavedDevice } from './store.js'
 import { equal, hash } from './crypto.js'
 import { createTurnKey, fetchIceServers, listTurnKeys, type CfAuth, type TurnKey } from './ice.js'
-import { PUBLIC_STUN, resolveStunUrls } from './stun.js'
+import { defaultStunServers, resolveStunUrls } from './stun.js'
 import { defaultSettings, sanitize, type Settings } from './settings.js'
 
 export interface Env {
@@ -105,7 +105,13 @@ export class Hub extends DurableObject<Env> {
   private send(ws: WebSocket, frame: ControlFrame): void { try { ws.send(JSON.stringify(frame)) } catch { /* closing */ } }
   private sendRaw(ws: WebSocket, raw: string): void { try { ws.send(raw) } catch { /* closing */ } }
   private get turnOn(): boolean { return this.cfg.turnEnabled && this.turn !== undefined }
-  private supported(): string[] { return SUPPORTED.filter(c => c !== 'transport.turn' || this.turnOn) }
+  private supported(): string[] {
+    return SUPPORTED.filter(c => {
+      if (c === 'transport.p2p') return this.cfg.p2pEnabled
+      if (c === 'transport.turn') return this.turnOn
+      return true
+    })
+  }
   private negotiated(offered: readonly string[]): string[] { return this.supported().filter(c => offered.includes(c)) }
   private async ensureAlarm(ms: number): Promise<void> {
     const cur = await this.ctx.storage.getAlarm()
@@ -340,16 +346,16 @@ export class Hub extends DurableObject<Env> {
         devices: { total: live.length, hosts: live.filter(d => d.descriptor.role === 'host').length, clients: live.filter(d => d.descriptor.role === 'client').length, online: socks.length },
         sockets: this.ctx.getWebSockets().length, links: Object.keys(this.links).length,
         turn: { configured: this.turn !== undefined, enabled: this.turnOn, keyId: this.turn?.keyId ?? null },
-        config: { heartbeatMs: this.cfg.heartbeatMs, maxConnections: this.cfg.maxConnections, turnTtlSeconds: this.cfg.turnTtlSeconds },
+        config: { heartbeatMs: this.cfg.heartbeatMs, maxConnections: this.cfg.maxConnections, turnTtlSeconds: this.cfg.turnTtlSeconds, p2pEnabled: this.cfg.p2pEnabled, stunEnabled: this.cfg.stunEnabled },
         origin: url.origin, you: actor,
       })
     }
     if (p === '/settings') {
-      if (method === 'GET') return json(200, { settings: this.cfg, defaults: defaultSettings(this.env), publicStun: PUBLIC_STUN, effectiveStun: resolveStunUrls(this.cfg) })
+      if (method === 'GET') return json(200, { settings: this.cfg, defaults: defaultSettings(this.env), defaultStun: defaultStunServers(), effectiveStun: resolveStunUrls(this.cfg) })
       if (method === 'PUT') {
         await this.applySettings(sanitize(await this.body(req) as Record<string, unknown>, this.cfg))
         await this.log('settings.update', '', actor)
-        return json(200, { settings: this.cfg })
+        return json(200, { settings: this.cfg, effectiveStun: resolveStunUrls(this.cfg) })
       }
     }
     if (p === '/accounts') {

@@ -4,35 +4,32 @@
 
 格式约定：版本标题固定为 `## v<版本号> (<YYYY-MM-DD>)`，下一行起用 `###` 分类（新增 / 修复 / 优化 / 文档），条目用 `- ` 列表。
 
-## v1.0.1 (2026-11-17)
+## v1.0.1 (2026-11-18)
 
-STUN 配置重构：新增「总开关 + 公共列表 + Cloudflare」三层开关，内置 10 条实测可用的公共 STUN 列表并设为默认。
+P2P / STUN 连接控制与卡片化后台管理重构：新增「打开 P2P」与「打开 STUN」双默认开启开关，内置完整 18 条公共 STUN 列表，并将 STUN 与 Origin 白名单管理全部升级为可添加、删除、单条禁用的卡片界面。
 
 ### 新增
 
-- **STUN 总开关（「启用 STUN」）**：关闭后不下发任何 STUN，**连 Cloudflare TURN 凭据里自带的两条也一并剔除**，客户端只剩 TURN / Relay。此前只能靠清空自定义列表，而 TURN 可用时又会把 Cloudflare 的 STUN 塞回来，等于关不掉。
-- **「启用公共列表 STUN」开关（默认开）**：追加内置公共列表 `PUBLIC_STUN`（`worker/src/stun.ts`），本版共 10 条：
-  - 国内：`stun.miwifi.com:3478`、`stun.chat.bilibili.com:3478`、`stun.hitv.com:3478`、`stun.douyucdn.cn:18000`
-  - 国际：`stun.cloudflare.com:443`、`stun.l.google.com:19302`、`stun1.l.google.com:19302`、`global.stun.twilio.com:3478`、`stun.voip.blackberry.com:3478`、`stun.nextcloud.com:443`
-  - 均在本机国内网络实测能返回 `XOR-MAPPED-ADDRESS`（各 2 次以上）；`stun.cloudflare.com:3478`、`stun.qq.com:3478`、`stun.sipgate.net`、`stunserver.stunprotocol.org`、`stun.syncthing.net`、`stun.ekiga.net`、`stun.ideasip.com`、`stun.bige0.com` 实测不通，未收录。
-- **「启用 Cloudflare STUN」开关（默认关）**：追加 `stun.cloudflare.com` 的 3478 / 443 两条；**只有填了自定义 STUN 才能开启**，否则保存时后端会强制关闭该开关（避免与 TURN 自带的 STUN 重复），后台对应行会显示「未启用」徽章并禁用。
-- **设置页新增「当前实际下发的 STUN（N 条）」预览**：直接展示三层开关解析后的最终列表，以及公共列表全文，改完保存即可对照，不用猜。
-- 新增 `GET /api/v1/admin/settings` 返回字段 `effectiveStun` / `publicStun`。
-- 新增环境变量默认值 `DSH_STUN_ENABLED`（true）、`DSH_STUN_USE_PUBLIC_LIST`（true）、`DSH_STUN_USE_CLOUDFLARE`（false）、`DSH_STUN_URLS`（空）。
+- **「打开 P2P」与「打开 STUN」默认双开开关**：
+  - `p2pEnabled`（环境变量 `DSH_P2P_ENABLED`，默认 `true`）：控制是否在 `hello.ack` 能力协商中开放 `transport.p2p`。
+  - `stunEnabled`（环境变量 `DSH_STUN_ENABLED`，默认 `true`）：控制是否下发用于 P2P NAT 打洞的 STUN 服务器；关闭后连同 TURN 凭据附带的 STUN 一并剔除。
+- **完整公共 STUN 列表（`worker/src/stun.ts` 的 `PUBLIC_STUN`，共 18 条）**：
+  - 覆盖国内（小米、哔哩哔哩、芒果 TV、斗鱼、腾讯）、Cloudflare（443 / 3478）与国际常用公共节点（Google 0–4、Twilio、BlackBerry、Nextcloud、Syncthing、Sipgate、StunProtocol），默认全部收录并可按需单独启用或禁用。
+- **卡片化服务器与 Origin 管理界面（`web/src/pages.tsx`）**：
+  - 移除原有繁琐的多行文本输入框，改为直观的卡片网格：每条 STUN 服务器和每条 Origin 规则均为独立卡片，支持单条**启用 / 禁用**切换、**删除**、行内**添加**。
+  - STUN 卡片区额外提供全部/已启用/已禁用筛选、全部启用/全部禁用、一键恢复默认列表，并明确标注「用于 P2P 打洞（不中转流量）」。
+- **前端版本号自动联动**：`web/vite.config.ts` 从 `web/package.json` 自动注入 `__APP_VERSION__`，页面底部版权栏始终与当前版本一致。
 
 ### 修复
 
-- **自定义 STUN 在 TURN 可用时被完全忽略**：旧实现只要 TURN 签发成功就原样返回 Cloudflare 的 `iceServers`，后台填写的地址根本不生效。现在按开关解析后**自定义排最前**，TURN 仅作为打洞失败后的中转兜底。
-- **关闭 TURN 会连带丢掉自定义 STUN**：改为「启用 TURN」只控制是否签发 TURN 凭据，STUN 完全由三个 STUN 开关决定。
-- **TURN 凭据里的 STUN 无法剔除**：新增 `stripStun` / `stripStunFromMixed`，总开关关闭时整条剔除，开启时也只保留被开关认可的地址。
-- **缓存键未包含 STUN 配置**：切换开关后最长 60 秒内仍拿到旧合并结果；现改为 `keyId:ttl:stunUrls`，保存即生效。
-- **设置项 16 条上限原先在格式过滤前生效**：改为先按 `stun:` / `stuns:` 过滤再截断。
+- **自定义 STUN 在 TURN 可用时被忽略 / 关闭 TURN 误丢 STUN**：`fetchIceServers` 按已启用的 STUN 列表合并并保留在最前，TURN 仅控制中继凭据签发，互不干扰。
+- **TURN 响应附带未启用 STUN**：`stripStun` 与 `stripStunFromMixed` 确保只在当前已启用列表中的 STUN 才会被保留；缓存键纳入 STUN 解析结果，保存设置后立即生效。
+- **Origin 输入框受 STUN 开关误禁用的问题**：改为独立卡片区管理，不再受 `stunEnabled` 状态连带禁用。
+- **旧版 DO 存储兼容迁移**：`settings.ts` 的 `sanitize()` 自动将旧版 `stunUrls` / `stunUsePublicList` / `stunUseCloudflare` / `allowedOrigins` 平滑迁移为新版 `stunServers` 与 `originRules` 结构。
 
-### 优化
+### 文档
 
-- 默认 STUN 从单条 `stun:stun.cloudflare.com:3478` 改为「公共列表全开 + Cloudflare 关闭」，开箱即用且国内可通。
-- 设置页文案补齐：总开关 / 自定义 / 公共列表 / Cloudflare 四项分别说明生效条件与顺序。
-- README 新增「STUN 与 ICE 配置」整节：三个开关的作用与约束、10 条公共列表的来源与实测结论、刻意排除的地址、环境变量默认值、排错建议。
+- 重写本 `v1.0.1` 变更说明，更新 `README.md` 的「P2P、STUN 与 ICE 配置」、环境变量表及 Release 解压示例版本号。
 
 ## v1.0.0 (2026-11-17)
 
