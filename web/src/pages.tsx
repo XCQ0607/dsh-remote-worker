@@ -149,7 +149,7 @@ export function Events() {
   const [d, reload] = useData<any>('/api/v1/admin/events', 10000)
   const [kind, setKind] = useState('')
   const toast = useToast()
-  const clear = async () => { if (!confirm('清空全部审计日志?')) return; await api('/api/v1/admin/events', { method: 'DELETE' }); toast('s', '已清空'); reload() }
+  const clear = async () => { if (!confirm('清空全部审计日志?')) return; try { await api('/api/v1/admin/events', { method: 'DELETE' }); toast('s', '已清空'); reload() } catch (e: any) { toast('e', e.message) } }
   const items = (d?.items ?? []).filter((e: any) => !kind || String(e.type).includes(kind))
   return (<>
     <Head title="审计日志" sub="最近 200 条登录与管理操作">
@@ -227,6 +227,7 @@ export function SettingsPage() {
   const [originInput, setOriginInput] = useState('')
   useEffect(() => { if (d) setS(d.settings) }, [d])
   if (!s) return null
+  const dirty = Boolean(d?.settings && JSON.stringify(s) !== JSON.stringify(d.settings))
 
   const onChange = (k: string, t: string, v: any) => setS({ ...s, [k]: t === 'num' ? Number(v) : v })
   const save = async (body: any) => {
@@ -360,5 +361,14 @@ export function SettingsPage() {
         </div>
       ) : <div className="empty" style={{ padding: '18px 0 6px' }}>未配置额外 Origin（默认仅允许同源访问）</div>}
     </div>
+    {dirty && (
+      <div className="save-bar">
+        <span className="badge warn"><i />有未保存的更改</span>
+        <div className="row right">
+          <button className="btn sm" onClick={() => setS(d.settings)}>撤销</button>
+          <button className="btn pri sm" onClick={() => save(s)}><Save size={14} />立即保存</button>
+        </div>
+      </div>
+    )}
   </>)
 }

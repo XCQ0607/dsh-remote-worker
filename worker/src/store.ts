@@ -27,21 +27,43 @@ export class Store {
   sessionHours = 8
   maxDevices = 256
   private devCache = new Map<string, SavedDevice>()
+  private allDevsLoaded = false
+  private acctCache = new Map<string, AccountRecord>()
+  private allAcctsLoaded = false
   private sesCache = new Map<string, SavedSession>()
   constructor(private s: DurableObjectStorage) {}
 
   // ---- accounts ----
-  async getAccount(email: string): Promise<AccountRecord | undefined> { return this.s.get<AccountRecord>(`acct:${normEmail(email)}`) }
-  async listAccounts(): Promise<string[]> { return [...(await this.s.list<AccountRecord>({ prefix: 'acct:' })).values()].map(a => a.email) }
+  private async ensureAccounts(): Promise<void> {
+    if (this.allAcctsLoaded) return
+    for (const a of (await this.s.list<AccountRecord>({ prefix: 'acct:' })).values()) this.acctCache.set(a.email, a)
+    this.allAcctsLoaded = true
+  }
+  async getAccount(email: string): Promise<AccountRecord | undefined> {
+    const e = normEmail(email)
+    let a = this.acctCache.get(e)
+    if (!a && !this.allAcctsLoaded) {
+      a = await this.s.get<AccountRecord>(`acct:${e}`)
+      if (a) this.acctCache.set(e, a)
+    }
+    return a
+  }
+  async listAccounts(): Promise<string[]> {
+    await this.ensureAccounts()
+    return [...this.acctCache.keys()]
+  }
   async upsertAccount(email: string, password: string): Promise<void> {
     const e = normEmail(email)
     if (!e || e.length > 254 || password.length < 12 || password.length > 1024) throw new ApiError('INVALID_MESSAGE')
     const salt = secret()
-    await this.s.put(`acct:${e}`, { email: e, salt, verifier: await pbkdf2(password, salt) } satisfies AccountRecord)
+    const rec: AccountRecord = { email: e, salt, verifier: await pbkdf2(password, salt) }
+    await this.s.put(`acct:${e}`, rec)
+    this.acctCache.set(e, rec)
     await this.deleteSessions(e)
   }
   async deleteAccount(email: string): Promise<void> {
     const e = normEmail(email)
+    this.acctCache.delete(e)
     await this.s.delete(`acct:${e}`)
     await this.deleteSessions(e)
     for (const d of await this.list(e, true)) await this.revokeRaw(d.descriptor.deviceId)
@@ -85,9 +107,14 @@ export class Store {
   }
 
   // ---- devices ----
+  private async ensureDevices(): Promise<void> {
+    if (this.allDevsLoaded) return
+    for (const d of (await this.s.list<SavedDevice>({ prefix: 'dev:' })).values()) this.devCache.set(d.descriptor.deviceId, d)
+    this.allDevsLoaded = true
+  }
   async get(id: string): Promise<SavedDevice> {
     let d = this.devCache.get(id)
-    if (!d) {
+    if (!d && !this.allDevsLoaded) {
       d = await this.s.get<SavedDevice>(`dev:${id}`)
       if (d) this.devCache.set(id, d)
     }
@@ -95,9 +122,13 @@ export class Store {
     if (d.revoked) throw new ApiError('DEVICE_REVOKED', 403)
     return d
   }
-  async listAll(): Promise<SavedDevice[]> { return [...(await this.s.list<SavedDevice>({ prefix: 'dev:' })).values()] }
+  async listAll(): Promise<SavedDevice[]> {
+    await this.ensureDevices()
+    return [...this.devCache.values()]
+  }
   async list(account: string, includeRevoked = false): Promise<SavedDevice[]> {
-    return [...(await this.s.list<SavedDevice>({ prefix: 'dev:' })).values()].filter(d => d.account === account && (includeRevoked || !d.revoked))
+    await this.ensureDevices()
+    return [...this.devCache.values()].filter(d => d.account === account && (includeRevoked || !d.revoked))
   }
   async register(account: string, raw: AccountDeviceDescriptor) {
     const descriptor = accountDeviceDescriptorSchema.parse(raw)

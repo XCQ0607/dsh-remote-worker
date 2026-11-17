@@ -25,6 +25,7 @@ export const listTurnKeys = (auth: CfAuth, accountId: string) =>
   cfApi<{ uid: string; name: string; created: string }[]>(auth, `/accounts/${accountId}/calls/turn_keys`)
 
 let cached: { key: string; expiresAt: number; servers: IceServer[] } | undefined
+export const clearIceCache = (): void => { cached = undefined }
 
 const urlsOf = (s: IceServer): string[] => (Array.isArray(s.urls) ? s.urls : [s.urls])
 /** 从 TURN 返回的条目里剔除 STUN 地址;条目若混合了 turn: 地址则只保留 TURN 部分。 */

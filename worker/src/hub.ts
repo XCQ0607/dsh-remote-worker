@@ -8,7 +8,7 @@ import {
 } from './protocol/index.js'
 import { ApiError, Store, normEmail, type SavedDevice } from './store.js'
 import { equal, hash } from './crypto.js'
-import { createTurnKey, fetchIceServers, listTurnKeys, type CfAuth, type TurnKey } from './ice.js'
+import { createTurnKey, clearIceCache, fetchIceServers, listTurnKeys, type CfAuth, type TurnKey } from './ice.js'
 import { defaultStunServers, resolveStunUrls } from './stun.js'
 import { defaultSettings, sanitize, type Settings } from './settings.js'
 
@@ -415,12 +415,13 @@ export class Hub extends DurableObject<Env> {
     // ---- TURN management (Cloudflare Realtime TURN API) ----
     if (p === '/turn') {
       if (method === 'GET') return json(200, { configured: this.turn !== undefined, keyId: this.turn?.keyId ?? null, source: (await this.ctx.storage.get('turn')) ? 'dashboard' : this.turn ? 'env' : null, enabled: this.cfg.turnEnabled })
-      if (method === 'DELETE') { await this.ctx.storage.delete('turn'); this.turn = this.env.TURN_KEY_ID && this.env.TURN_KEY_API_TOKEN ? { keyId: String(this.env.TURN_KEY_ID).trim(), apiToken: String(this.env.TURN_KEY_API_TOKEN).trim() } : undefined; await this.log('turn.clear', '', actor); return json(200, { status: 'ok' }) }
+      if (method === 'DELETE') { await this.ctx.storage.delete('turn'); this.turn = this.env.TURN_KEY_ID && this.env.TURN_KEY_API_TOKEN ? { keyId: String(this.env.TURN_KEY_ID).trim(), apiToken: String(this.env.TURN_KEY_API_TOKEN).trim() } : undefined; clearIceCache(); await this.log('turn.clear', '', actor); return json(200, { status: 'ok' }) }
     }
     if (method === 'POST' && p === '/turn/manual') {
       const b = z.object({ keyId: z.string().trim().min(8).max(64), apiToken: z.string().trim().min(8).max(256) }).parse(await this.body(req))
       this.turn = { keyId: b.keyId, apiToken: b.apiToken }
       await this.ctx.storage.put('turn', this.turn)
+      clearIceCache()
       await this.log('turn.manual', b.keyId, actor)
       return json(200, { status: 'ok', keyId: b.keyId })
     }
@@ -432,6 +433,7 @@ export class Hub extends DurableObject<Env> {
         const key = await createTurnKey(auth, b.accountId, b.name || 'dsh-remote-turn')
         this.turn = key
         await this.ctx.storage.put('turn', key)
+        clearIceCache()
         await this.log('turn.provision', key.keyId, actor)
         return json(200, { status: 'ok', keyId: key.keyId })
       } catch (e) { return json(502, { error: { code: 'CLOUDFLARE_API_ERROR', message: String(e instanceof Error ? e.message : e).slice(0, 300), retryable: false } }) }
