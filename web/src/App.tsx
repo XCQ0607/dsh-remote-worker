@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Activity, KeyRound, LayoutDashboard, Link2, LogOut, Moon, Radio, ScrollText, Server, Settings, Sun, Users } from 'lucide-react'
 import { api } from './api'
 import { ToastCtx } from './toast'
@@ -51,8 +51,16 @@ export function App() {
     setToasts(t => [...t, { id, kind, text }]); setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500)
   }, [])
   const load = useCallback(() => { api<Me>('/api/v1/auth/me').then(setMe).catch(() => setMe(null)) }, [])
+  const navRef = useRef<HTMLElement | null>(null)
   useEffect(load, [load])
   useEffect(() => { location.hash = tab }, [tab])
+  // 手机端导航是横向滚动条，切换后把当前项滚进可视区
+  useEffect(() => {
+    const box = navRef.current
+    const active = box?.querySelector<HTMLElement>('.nav.on')
+    if (!box || !active || box.scrollWidth <= box.clientWidth) return
+    box.scrollTo({ left: Math.max(0, active.offsetLeft - (box.clientWidth - active.offsetWidth) / 2), behavior: 'smooth' })
+  }, [tab])
 
   let body: ReactNode
   if (me === undefined) body = null
@@ -69,7 +77,7 @@ export function App() {
               <button className="nav icon-only" title="退出登录" onClick={async () => { await api('/api/v1/auth/logout', { method: 'POST', body: {} }); setMe(null) }}><LogOut size={18} /></button>
             </div>
           </div>
-          <nav className="side-nav">
+          <nav className="side-nav" ref={navRef}>
             {me.isAdmin ? ADMIN_TABS.map(([id, label, Icon]) => (
               <button key={id} className={`nav ${tab === id ? 'on' : ''}`} onClick={() => setTab(id)}><Icon size={18} /><span>{label}</span></button>
             )) : <button className="nav on"><Activity size={18} /><span>我的设备</span></button>}

@@ -11,7 +11,7 @@ function useData<T>(path: string, every = 0) {
   return [data, reload] as const
 }
 const Head = ({ title, sub, children }: { title: string; sub: string; children?: ReactNode }) => (
-  <div className="row" style={{ marginBottom: 20 }}><div><h1>{title}</h1><p className="sub" style={{ margin: 0 }}>{sub}</p></div><div className="right row">{children}</div></div>
+  <div className="page-head"><div className="page-head-text"><h1>{title}</h1><p className="sub">{sub}</p></div>{children && <div className="page-head-actions">{children}</div>}</div>
 )
 const Badge = ({ ok, children }: { ok: boolean; children: ReactNode }) => <span className={`badge ${ok ? 'ok' : ''}`}><i />{children}</span>
 const Stat = ({ icon, label, value, unit }: { icon: ReactNode; label: string; value: ReactNode; unit?: string }) => (
@@ -71,8 +71,8 @@ export function MyDevices() {
       {d?.serverUrl && <button className="btn" onClick={() => { navigator.clipboard.writeText(d.serverUrl); toast('s', '已复制接入地址') }}><Copy size={15} />复制接入地址</button>}
       <button className="btn" onClick={reload}><RefreshCw size={15} />刷新</button>
     </Head>
-    <div className="card" style={{ marginBottom: 16, overflowX: 'auto' }}><table><thead><tr><th>名称</th><th>角色</th><th>平台</th><th>状态</th><th>最近在线</th><th /></tr></thead><tbody>
-      {d?.items?.map((x: any) => <tr key={x.deviceId}><td>{x.name || x.deviceId}<div className="mono">{x.deviceId}</div></td><td>{x.role}</td><td>{x.platform ?? '-'}</td><td><Badge ok={x.online}>{x.online ? '在线' : '离线'}</Badge></td><td className="mono">{fmtAgo(x.lastSeenAt)}</td>
+    <div className="card tablecard" style={{ marginBottom: 16 }}><table><thead><tr><th>名称</th><th>角色</th><th>平台</th><th>状态</th><th>最近在线</th><th /></tr></thead><tbody>
+      {d?.items?.map((x: any) => <tr key={x.deviceId}><td data-label="名称">{x.name || x.deviceId}<div className="mono">{x.deviceId}</div></td><td data-label="角色">{x.role}</td><td data-label="平台">{x.platform ?? '-'}</td><td data-label="状态"><Badge ok={x.online}>{x.online ? '在线' : '离线'}</Badge></td><td data-label="最近在线" className="mono">{fmtAgo(x.lastSeenAt)}</td>
         <td><div className="row"><button className="btn sm" onClick={() => rename(x.deviceId, x.name || '')}><Pencil size={13} />改名</button>
           <button className="btn sm danger" onClick={() => revoke(x.deviceId)}><Ban size={13} />吊销</button></div></td></tr>)}
     </tbody></table>{d && !d.items.length && <div className="empty">暂无设备</div>}</div>
@@ -97,14 +97,13 @@ export function AllDevices() {
   return (<>
     <Head title="全部设备" sub="跨账号查看、踢下线、吊销"><button className="btn" onClick={reload}><RefreshCw size={15} />刷新</button></Head>
     <div className="row" style={{ marginBottom: 14 }}>
-      <div style={{ flex: 1, minWidth: 220, position: 'relative' }}><Search size={14} style={{ position: 'absolute', left: 11, top: 12, color: 'var(--mut)' }} />
-        <input style={{ paddingLeft: 32 }} placeholder="搜索设备名 / ID / 账号" value={q} onChange={e => setQ(e.target.value)} /></div>
-      {(['all', 'on', 'off'] as const).map(k => <button key={k} className={`btn ${only === k ? 'pri' : ''}`} onClick={() => setOnly(k)}>{k === 'all' ? '全部' : k === 'on' ? '仅在线' : '仅离线'}</button>)}
+      <div className="search-box"><Search size={14} /><input placeholder="搜索设备名 / ID / 账号" value={q} onChange={e => setQ(e.target.value)} /></div>
+      <div className="seg">{(['all', 'on', 'off'] as const).map(k => <button key={k} className={`btn ${only === k ? 'pri' : ''}`} onClick={() => setOnly(k)}>{k === 'all' ? '全部' : k === 'on' ? '仅在线' : '仅离线'}</button>)}</div>
     </div>
-    <div className="card" style={{ overflowX: 'auto' }}><table><thead><tr><th>设备</th><th>账号</th><th>角色</th><th>版本</th><th>状态</th><th>最近在线</th><th /></tr></thead><tbody>
+    <div className="card tablecard"><table><thead><tr><th>设备</th><th>账号</th><th>角色</th><th>版本</th><th>状态</th><th>最近在线</th><th /></tr></thead><tbody>
       {items.map((x: any) => <tr key={x.deviceId}>
-        <td>{x.name || '-'}<div className="mono">{x.deviceId}</div></td><td>{x.account}</td><td>{x.role}</td><td className="mono">{x.clientVersion ?? '-'}</td>
-        <td><Badge ok={x.online}>{x.online ? '在线' : '离线'}</Badge></td><td className="mono">{fmtAgo(x.lastSeenAt)}</td>
+        <td data-label="设备">{x.name || '-'}<div className="mono">{x.deviceId}</div></td><td data-label="账号">{x.account}</td><td data-label="角色">{x.role}</td><td data-label="版本" className="mono">{x.clientVersion ?? '-'}</td>
+        <td data-label="状态"><Badge ok={x.online}>{x.online ? '在线' : '离线'}</Badge></td><td data-label="最近在线" className="mono">{fmtAgo(x.lastSeenAt)}</td>
         <td><div className="row">{x.online && <button className="btn sm" onClick={() => act(x.deviceId, 'disconnect')}><Unplug size={13} />踢下线</button>}
           <button className="btn sm danger" onClick={() => act(x.deviceId, 'revoke')}><Ban size={13} />吊销</button></div></td></tr>)}
     </tbody></table>{d && !items.length && <div className="empty">没有匹配的设备</div>}</div>
@@ -125,8 +124,8 @@ export function Accounts() {
       <div className="form2"><div className="field"><label>邮箱</label><input value={email} onChange={e => setEmail(e.target.value)} /></div>
         <div className="field"><label>密码(≥12 位)</label><input type="password" value={password} onChange={e => setPassword(e.target.value)} /></div></div>
       <button className="btn pri" disabled={!email || password.length < 12} onClick={save}><Save size={15} />保存</button></div>
-    <div className="card" style={{ overflowX: 'auto' }}><table><thead><tr><th>账号</th><th>设备</th><th>在线</th><th /></tr></thead><tbody>
-      {d?.items?.map((a: any) => <tr key={a.email}><td>{a.email} {a.admin && <span className="badge warn"><i />管理员</span>}</td><td>{a.devices}</td><td>{a.online}</td>
+    <div className="card tablecard"><table><thead><tr><th>账号</th><th>设备</th><th>在线</th><th /></tr></thead><tbody>
+      {d?.items?.map((a: any) => <tr key={a.email}><td data-label="账号">{a.email} {a.admin && <span className="badge warn"><i />管理员</span>}</td><td data-label="设备">{a.devices}</td><td data-label="在线">{a.online}</td>
         <td style={{ textAlign: 'right' }}><button className="btn sm danger" onClick={() => del(a.email)}><Trash2 size={13} />删除</button></td></tr>)}
     </tbody></table></div>
   </>)
@@ -138,9 +137,9 @@ export function Links() {
   const drop = async (id: string) => { try { await api(`/api/v1/admin/links/${id}`, { method: 'DELETE' }); toast('s', '已断开'); reload() } catch (e: any) { toast('e', e.message) } }
   return (<>
     <Head title="实时连接" sub="Host ⇄ Client 的逻辑连接(每 3 秒刷新)" />
-    <div className="card" style={{ overflowX: 'auto' }}><table><thead><tr><th>连接</th><th>Host</th><th>Client</th><th>阶段</th><th>传输</th><th>时长</th><th /></tr></thead><tbody>
-      {d?.items?.map((l: any) => <tr key={l.id}><td className="mono">{l.id.slice(0, 8)}</td><td className="mono">{l.host.slice(0, 12)}</td><td className="mono">{l.client.slice(0, 12)}</td>
-        <td><Badge ok={l.stage === 'ready'}>{l.stage}</Badge></td><td>{l.preferredTransports.join(' / ')}</td><td className="mono">{fmtDur(l.ageMs)}</td>
+    <div className="card tablecard"><table><thead><tr><th>连接</th><th>Host</th><th>Client</th><th>阶段</th><th>传输</th><th>时长</th><th /></tr></thead><tbody>
+      {d?.items?.map((l: any) => <tr key={l.id}><td data-label="连接" className="mono">{l.id.slice(0, 8)}</td><td data-label="Host" className="mono">{l.host.slice(0, 12)}</td><td data-label="Client" className="mono">{l.client.slice(0, 12)}</td>
+        <td data-label="阶段"><Badge ok={l.stage === 'ready'}>{l.stage}</Badge></td><td data-label="传输">{l.preferredTransports.join(' / ')}</td><td data-label="时长" className="mono">{fmtDur(l.ageMs)}</td>
         <td><button className="btn sm danger" onClick={() => drop(l.id)}><XCircle size={13} />断开</button></td></tr>)}
     </tbody></table>{d && !d.items.length && <div className="empty">当前没有活动连接</div>}</div>
   </>)
@@ -154,12 +153,12 @@ export function Events() {
   const items = (d?.items ?? []).filter((e: any) => !kind || String(e.type).includes(kind))
   return (<>
     <Head title="审计日志" sub="最近 200 条登录与管理操作">
-      <input style={{ width: 170 }} placeholder="按事件筛选 (如 login)" value={kind} onChange={e => setKind(e.target.value)} />
+      <input className="filter-input" placeholder="按事件筛选 (如 login)" value={kind} onChange={e => setKind(e.target.value)} />
       <button className="btn" onClick={reload}><RefreshCw size={15} />刷新</button>
       <button className="btn danger" onClick={clear}><Trash2 size={15} />清空</button>
     </Head>
-    <div className="card" style={{ overflowX: 'auto' }}><table><thead><tr><th>时间</th><th>事件</th><th>详情</th><th>操作者</th></tr></thead><tbody>
-      {items.map((e: any, i: number) => <tr key={i}><td className="mono">{new Date(e.t).toLocaleString()}</td><td>{e.type}</td><td className="mono">{e.detail}</td><td className="mono">{e.actor}</td></tr>)}
+    <div className="card tablecard"><table><thead><tr><th>时间</th><th>事件</th><th>详情</th><th>操作者</th></tr></thead><tbody>
+      {items.map((e: any, i: number) => <tr key={i}><td data-label="时间" className="mono">{new Date(e.t).toLocaleString()}</td><td data-label="事件">{e.type}</td><td data-label="详情" className="mono">{e.detail}</td><td data-label="操作者" className="mono">{e.actor}</td></tr>)}
     </tbody></table>{d && !items.length && <div className="empty">暂无记录</div>}</div>
   </>)
 }
