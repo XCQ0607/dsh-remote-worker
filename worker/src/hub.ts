@@ -272,7 +272,9 @@ export class Hub extends DurableObject<Env> {
       const cid = url.searchParams.get('connection_id') ?? ''
       if (!cid || cid.length > 128) throw new ApiError('INVALID_MESSAGE')
       if (!this.authorizeIce(source.descriptor.deviceId, cid)) throw new ApiError('CONNECTION_NOT_FOUND', 404)
-      return json(200, { iceServers: this.cfg.turnEnabled ? (await fetchIceServers(this.turn, this.cfg.turnTtlSeconds, this.cfg.stunUrls)).servers : (this.cfg.stunUrls.length ? [{ urls: this.cfg.stunUrls }] : []) })
+      // turnEnabled 只控制是否签发 TURN 凭据;自定义 STUN 始终下发,便于国内网络优先尝试直连。
+      const { servers } = await fetchIceServers(this.turnOn ? this.turn : undefined, this.cfg.turnTtlSeconds, this.cfg.stunUrls)
+      return json(200, { iceServers: servers })
     }
     if (method === 'GET' && path === '/api/v1/devices') {
       const source = await this.deviceAuth(req)

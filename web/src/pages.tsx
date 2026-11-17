@@ -212,9 +212,9 @@ const FIELDS: { key: string; label: string; hint: string; type: 'num' | 'bool' |
   { key: 'maxFramesPerSec', label: '单连接每秒帧数上限', hint: '超限返回 RATE_LIMITED', type: 'num' },
   { key: 'maxConnections', label: 'WebSocket 并发上限', hint: '8–1024', type: 'num' },
   { key: 'maxDevicesPerAccount', label: '每账号设备上限', hint: '1–4096', type: 'num' },
-  { key: 'turnEnabled', label: '启用 TURN', hint: '关闭后只走 P2P / Relay', type: 'bool' },
+  { key: 'turnEnabled', label: '启用 TURN', hint: '关闭后不下发 TURN 凭据,只走 P2P / Relay;自定义 STUN 仍会下发', type: 'bool' },
   { key: 'turnTtlSeconds', label: 'TURN 凭据有效期(秒)', hint: '60–3600', type: 'num' },
-  { key: 'stunUrls', label: 'STUN 服务器', hint: '每行一个 stun: 地址', type: 'list' },
+  { key: 'stunUrls', label: 'STUN 服务器', hint: '每行一个 stun:/stuns: 地址,最多 16 条;会与 Cloudflare 下发的 STUN 合并(自填的排在前面)。清空则只用 TURN 凭据自带的 STUN', type: 'list' },
   { key: 'allowedOrigins', label: '额外允许的 Origin', hint: '每行一个,如 https://dsh.example.com;自定义域名 Origin 与访问域名相同时无需填写', type: 'list' },
 ]
 

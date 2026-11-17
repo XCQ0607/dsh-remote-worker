@@ -202,7 +202,7 @@ cd ../web && npm ci && npm run build
 | `DSH_SESSION_HOURS`           | `8`                             | Web 登录有效期（小时）                                                         |
 | `DSH_TURN_ENABLED`            | `true`                          | 是否启用 TURN                                                                  |
 | `DSH_TURN_TTL_SECONDS`        | `300`                           | 短期 TURN 凭据有效期（秒）                                                     |
-| `DSH_STUN_URLS`               | `stun:stun.cloudflare.com:3478` | 公共 STUN 地址（逗号分隔）                                                     |
+| `DSH_STUN_URLS`               | `stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:443` | STUN 地址（逗号分隔，最多 16 条）；会与 TURN 凭据自带的 STUN 合并，自填的排在前面                                                     |
 | `DSH_ALLOWED_ORIGINS`         | `""`                            | 额外允许的 Origin（逗号分隔）                                                  |
 | `DSH_DO_LOCATION`             | `""`                            | Durable Object 区域提示（`apac` / `wnam` / `weur` 等，仅对新建 DO 生效） |
 

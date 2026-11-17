@@ -26,12 +26,21 @@ export const listTurnKeys = (auth: CfAuth, accountId: string) =>
 
 let cached: { key: string; expiresAt: number; servers: IceServer[] } | undefined
 
+/** 判断 TURN 返回的条目是否就是同一组 STUN,避免同一批地址重复下发。 */
+const urlsOf = (s: IceServer): string[] => (Array.isArray(s.urls) ? s.urls : [s.urls])
+const isSameStunEntry = (a: IceServer, b: IceServer): boolean => {
+  const x = new Set(urlsOf(a).map(u => u.trim().toLowerCase())), y = urlsOf(b).map(u => u.trim().toLowerCase())
+  return y.length > 0 && y.every(u => x.has(u))
+}
+
 export async function fetchIceServers(
   turn: TurnKey | undefined,
   ttl: number,
   stunUrls: string[],
   noCache = false,
 ): Promise<{ servers: IceServer[]; turn: boolean; error?: string }> {
+  // 自定义 STUN(后台「STUN 服务器」)始终排在最前:即使 TURN 可用也一并下发,
+  // 这样国内网络可以用自建/国内 STUN 先探测直连,TURN 只作为打洞失败后的中转兜底。
   const stun: IceServer[] = stunUrls.length ? [{ urls: stunUrls }] : []
   if (!turn) return { servers: stun, turn: false }
   const cacheKey = `${turn.keyId}:${ttl}`
@@ -50,9 +59,11 @@ export async function fetchIceServers(
     const data = await res.json() as { iceServers?: IceServer[] | IceServer }
     const list = Array.isArray(data.iceServers) ? data.iceServers : data.iceServers ? [data.iceServers] : []
     if (!list.length) return { servers: stun, turn: false, error: 'empty response' }
+    // Cloudflare 返回的 iceServers 自带 Cloudflare 的 STUN;自定义 STUN 合并去重后放在前面优先尝试。
+    const merged = stun.length ? [stun[0]!, ...list.filter(s => !isSameStunEntry(s, stun[0]!))] : list
     // Reuse credentials for at most half the TTL (capped at 60s) so clients always get >= 240s validity
-    cached = { key: cacheKey, expiresAt: now + Math.min(60, Math.floor(ttl / 2)) * 1000, servers: list }
-    return { servers: list, turn: true }
+    cached = { key: cacheKey, expiresAt: now + Math.min(60, Math.floor(ttl / 2)) * 1000, servers: merged }
+    return { servers: merged, turn: true }
   } catch (e) {
     console.error('turn_credentials_failed', String(e))
     return { servers: stun, turn: false, error: String(e) }

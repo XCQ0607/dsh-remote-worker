@@ -32,7 +32,7 @@ export function defaultSettings(env: EnvLike): Settings {
     heartbeatMs: env.DSH_HEARTBEAT_MS, helloTimeoutMs: env.DSH_HELLO_TIMEOUT_MS, heartbeatDisconnectMs: env.DSH_HEARTBEAT_DISCONNECT_MS,
     maxFramesPerSec: env.DSH_MAX_FRAMES_PER_SEC, maxConnections: env.DSH_MAX_CONNECTIONS, maxDevicesPerAccount: env.DSH_MAX_DEVICES_PER_ACCOUNT,
     sessionHours: env.DSH_SESSION_HOURS, turnEnabled: env.DSH_TURN_ENABLED !== 'false', turnTtlSeconds: env.TURN_TTL_SECONDS ?? env.DSH_TURN_TTL_SECONDS,
-    stunUrls: env.DSH_STUN_URLS ?? 'stun:stun.cloudflare.com:3478', siteName: env.DSH_SITE_NAME ?? 'DSH Remote', allowedOrigins: env.DSH_ALLOWED_ORIGINS ?? '',
+    stunUrls: env.DSH_STUN_URLS ?? 'stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:443', siteName: env.DSH_SITE_NAME ?? 'DSH Remote', allowedOrigins: env.DSH_ALLOWED_ORIGINS ?? '',
   }, {
     heartbeatMs: 25_000, helloTimeoutMs: 5000, heartbeatDisconnectMs: 75_000, maxFramesPerSec: 512, maxConnections: 256,
     maxDevicesPerAccount: 256, sessionHours: 8, turnEnabled: true, turnTtlSeconds: 300, stunUrls: [], siteName: 'DSH Remote', allowedOrigins: [],

@@ -4,6 +4,23 @@
 
 格式约定：版本标题固定为 `## v<版本号> (<YYYY-MM-DD>)`，下一行起用 `###` 分类（新增 / 修复 / 优化 / 文档），条目用 `- ` 列表。
 
+## v1.0.1 (2026-11-17)
+
+STUN / TURN 配置行为修正：自定义 STUN 不再被 TURN 覆盖，默认值改为国内可用服务器。
+
+### 修复
+
+- **自定义 STUN 在 TURN 可用时被完全忽略**：此前 `fetchIceServers` 只要 TURN 签发成功就原样返回 Cloudflare 的 `iceServers`，后台「STUN 服务器」填写的地址根本不生效（Cloudflare 只会带上它自己的 `stun:stun.cloudflare.com:3478` 和 `stun:stun.cloudflare.com:443`）。现在自定义 STUN 会合并进返回列表并**排在最前**，客户端优先用你指定的服务器探测直连，TURN 仅作为打洞失败后的中转兜底。
+- **关闭「启用 TURN」时 STUN 也被一起丢掉**：改为 `turnEnabled` 只控制是否签发 TURN 凭据，自定义 STUN 始终下发。
+- **设置项最多 16 条的限制原先在截断前生效**：现在先按 `stun:` / `stuns:` 格式过滤，再截断到 16 条，避免格式错误的行挤占配额。
+
+### 优化
+
+- **默认 STUN 改为国内可用组合**：`DSH_STUN_URLS` 默认值从 `stun:stun.cloudflare.com:3478` 改为 `stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:443`。
+  - 实测（本机国内网络，UDP 各 3 次）：`stun.miwifi.com:3478` 3/3、`stun.chat.bilibili.com:3478` 3/3、`stun.hitv.com:3478` 3/3、`stun.douyucdn.cn:18000` 3/3、`stun.cloudflare.com:443` 3/3 均正常；
+  - 而 `stun.cloudflare.com:3478` 与 `stun.qq.com:3478` 在当前网络下 **0/3**（UDP 无应答），这正是原来默认值在国内不好用的原因，因此改用 443 端口那条。
+- **设置页文案**补充说明「每行一个 stun:/stuns: 地址,最多 16 条;会与 Cloudflare 下发的 STUN 合并(自填的排在前面)」，并把「启用 TURN」的提示改为「关闭后不下发 TURN 凭据,只走 P2P / Relay;自定义 STUN 仍会下发」，避免误解。
+
 ## v1.0.0 (2026-11-17)
 
 首个正式版本：基于 Cloudflare Workers + Durable Objects（SQLite + WebSocket Hibernation）重构的 `ds-harness-remote` 自建中转服务端，可在 Cloudflare **免费版**直接运行。
