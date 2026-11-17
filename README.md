@@ -48,7 +48,7 @@ Worker (worker/src/index.ts)          ← 无状态路由 + 安全响应头 + �
 
 ### 1. 下载并解压
 
-在仓库 **Releases** 页面下载对应 zip，解压后进入目录（下文以 `dsh-remote-worker-v1.0.0` 为例）：
+在仓库 **Releases** 页面下载对应 zip，解压后进入目录（下文以 `dsh-remote-worker-v1.0.1` 为例）：
 
 ```bash
 # 可选：核对校验和
@@ -58,7 +58,7 @@ sha256sum -c SHA256SUMS.txt
 解压后的目录结构：
 
 ```
-dsh-remote-worker-v1.0.0/
+dsh-remote-worker-v1.0.1/
 ├── worker/            # Worker 源码 + 已构建的 public/ 前端（wrangler.jsonc 在此）
 ├── scripts/deploy.mjs # 一键部署脚本
 ├── env-template.json  # 配置模板，复制为 env.json 后填写
