@@ -10,11 +10,24 @@ P2P / STUN 连接控制与卡片化后台管理重构：新增「打开 P2P」�
 
 ### 新增
 
+- **OAuth 扫码登录与客户端协议对齐**：
+  - 对齐官方客户端 `pollQrLogin` 状态机（`pending` / `expired` / `complete`），支持桌面端插件一键扫码/浏览器授权登录。
+  - 支持后台动态新增、编辑与持久化 OAuth 提供方，支持注册邮箱白名单/黑名单控制。
+- **邀请码管理与 OAuth 邀请注册**：
+  - 独立「邀请码」管理栏，支持单个/批量生成（1–100）、状态 Tag（可用/已用完/已过期）筛选、使用用户明细查看，以及批量复制、批量清理与 TXT/CSV/JSON 导出。
+  - OAuth 开启注册时支持「需要邀请码」开关，新用户授权后输入邀请码完成建号与登录。
+- **个人中心与多 Webhook 告警**：
+  - 支持自助修改/设置初始密码、查看与踢出活跃会话、生成与作废 `XXXX-XXXX` 主机匹配码。
+  - 支持添加多个 Webhook，自动识别飞书 / 钉钉 / 企业微信 / Discord 图标与消息格式，支持指定监控设备与在线测试。
+- **网络诊断、审计导出与性能优化**：
+  - 新增「网络诊断」页，支持 Relay API 延迟探测与 WebRTC STUN/ICE 候选收集测试；审计日志支持筛选与 JSON/CSV 导出。
+  - Durable Object 增加 `oauthOverrides` 内存缓存与 `alarm()` 定期清理过期会话/临时凭证，修复移动端网格布局留白问题。
 - **「打开 P2P」与「打开 STUN」默认双开开关**：
   - `p2pEnabled`（环境变量 `DSH_P2P_ENABLED`，默认 `true`）：控制是否在 `hello.ack` 能力协商中开放 `transport.p2p`。
   - `stunEnabled`（环境变量 `DSH_STUN_ENABLED`，默认 `true`）：控制是否下发用于 P2P NAT 打洞的 STUN 服务器；关闭后连同 TURN 凭据附带的 STUN 一并剔除。
-- **完整公共 STUN 列表（`worker/src/stun.ts` 的 `PUBLIC_STUN`，共 18 条）**：
-  - 覆盖国内（小米、哔哩哔哩、芒果 TV、斗鱼、腾讯）、Cloudflare（443 / 3478）与国际常用公共节点（Google 0–4、Twilio、BlackBerry、Nextcloud、Syncthing、Sipgate、StunProtocol），默认全部收录并可按需单独启用或禁用。
+- **完整公共 STUN 列表（`worker/src/stun.ts` 的 `PUBLIC_STUN`，共 18 条）与启用上限（`maxEnabledStun`，默认 6）**：
+  - 收录国内、Cloudflare 与国际常用公共节点共 18 条卡片；基于国内实测（39–70ms），**默认仅启用斗鱼、芒果 TV、小米、哔哩哔哩 4 条最快国内节点**，其余 14 条默认禁用按需开启，避免过多/超时 STUN 拖垮 12 秒 WebRTC 超时窗口退回 Relay。
+  - 新增 `DSH_MAX_ENABLED_STUN`（范围 1–16，默认 6），前后端共同限制同时启用的 STUN 数量。
 - **卡片化服务器与 Origin 管理界面（`web/src/pages.tsx`）**：
   - 移除原有繁琐的多行文本输入框，改为直观的卡片网格：每条 STUN 服务器和每条 Origin 规则均为独立卡片，支持单条**启用 / 禁用**切换、**删除**、行内**添加**。
   - STUN 卡片区额外提供全部/已启用/已禁用筛选、全部启用/全部禁用、一键恢复默认列表，并明确标注「用于 P2P 打洞（不中转流量）」。

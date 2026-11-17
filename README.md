@@ -204,6 +204,7 @@ cd ../web && npm ci && npm run build
 | `DSH_TURN_ENABLED`            | `true`                          | 是否启用 TURN（P2P 失败时的中继兜底）                                          |
 | `DSH_TURN_TTL_SECONDS`        | `300`                           | 短期 TURN 凭据有效期（秒）                                                     |
 | `DSH_STUN_ENABLED`            | `true`                          | STUN 总开关默认值（用于 P2P 打洞；关闭后不下发任何 STUN）                      |
+| `DSH_MAX_ENABLED_STUN`        | `6`                             | 同时启用的 STUN 数量上限（1–16，防止过多超时 STUN 拖慢 ICE 建连）              |
 | `DSH_STUN_URLS`               | `""`                            | 额外自定义 STUN（逗号分隔），会排在默认公共 STUN 列表之前                      |
 | `DSH_STUN_USE_PUBLIC_LIST`    | `true`                          | 初始化时是否附带内置完整公共 STUN 列表                                         |
 | `DSH_ALLOWED_ORIGINS`         | `""`                            | 额外允许的 Origin（逗号分隔，后台支持卡片式增删与禁用）                        |
@@ -257,6 +258,34 @@ curl -X POST https://你的域名/api/v1/admin/accounts \
 
 ---
 
+## 第三方 OAuth 登录（GitHub / Google 等）
+
+后台支持 GitHub、Google 及自定义 OAuth 登录，由 `provider.json` 配置（模板：`provider-template.json`），可按提供方控制是否允许自动注册，管理员可在后台「OAuth 登录」页开关。完整申请与配置流程见 **[md/oauth.md](./md/oauth.md)**。
+
+## 本地启动与测试
+
+```bash
+npm --prefix web install && npm --prefix worker install
+npm run build:web                       # 构建前端到 worker/public
+```
+
+在 `worker/.dev.vars`（已 gitignore）写入，每项一行：
+
+```
+ADMIN_TOKEN=至少16位的随机串
+ADMIN_ACCOUNTS=你的邮箱
+OAUTH_PROVIDERS={"providers":{"github":{"clientId":"...","clientSecret":"..."}}}
+```
+
+```bash
+cd worker && npx wrangler dev           # 默认 http://localhost:8787
+```
+
+- 创建本地账号：`curl -X POST http://localhost:8787/api/v1/admin/accounts -H "Authorization: Bearer <ADMIN_TOKEN>" -H "Content-Type: application/json" -d '{"email":"a@b.c","password":"至少12位的密码"}'`
+- 测试 OAuth：GitHub OAuth App 的回调地址填 `http://localhost:8787/api/v1/auth/oauth/github/callback`（Google 同理，且 localhost 可用 http）。务必用 `localhost` 而非 `127.0.0.1` 访问。
+- 前端热更新：`npm --prefix web run dev`（改动后需 `npm run build:web` 才进入 Worker）。
+- 改 `.dev.vars` 后需重启 `wrangler dev`。
+
 ## 管理后台与 TURN 使用
 
 直接访问绑定的域名即可打开管理后台：
@@ -280,11 +309,10 @@ curl -X POST https://你的域名/api/v1/admin/accounts \
 ### 公共 STUN 卡片管理（用于 P2P 打洞）
 
 后台「系统设置」页使用**卡片列表**管理 STUN 与 Origin 白名单，不再使用多行文本框：
-- **每张卡片独立控制**：支持单条**启用 / 禁用**开关、**删除**、按状态筛选（全部 / 已启用 / 已禁用）、全部启用/禁用、新增自定义地址，以及一键**恢复默认列表**。
-- **内置完整公共列表**（`worker/src/stun.ts` 的 `PUBLIC_STUN`，共 18 条，默认全部收录并启用）：
-  - **国内节点**：小米 `stun.miwifi.com:3478`、哔哩哔哩 `stun.chat.bilibili.com:3478`、芒果 TV `stun.hitv.com:3478`、斗鱼 `stun.douyucdn.cn:18000`、腾讯 `stun.qq.com:3478`
-  - **Cloudflare**：`stun.cloudflare.com:443`、`stun.cloudflare.com:3478`
-  - **国际节点**：Google（`stun` / `stun1` / `stun2` / `stun3` / `stun4.l.google.com:19302`）、Twilio `global.stun.twilio.com:3478`、BlackBerry `stun.voip.blackberry.com:3478`、Nextcloud `stun.nextcloud.com:443`、Syncthing `stun.syncthing.net:3478`、Sipgate `stun.sipgate.net:3478`、StunProtocol `stunserver.stunprotocol.org:3478`
+- **每张卡片独立控制**：支持单条**启用 / 禁用**开关、**删除**、按状态筛选（全部 / 已启用 / 已禁用）、仅启用国内推荐、全部禁用、新增自定义地址，以及一键**恢复默认列表**；同时通过 **STUN 同时启用上限**（`DSH_MAX_ENABLED_STUN`，默认 6）防止过长列表拖垮 WebRTC 12 秒超时窗口。
+- **内置完整公共列表**（`worker/src/stun.ts` 的 `PUBLIC_STUN`，共 18 条；**默认仅启用国内实测响应最快的 4 条 <70ms 节点**，其余默认禁用可按需在卡片开启）：
+  - **国内推荐（默认开启，实测 39–70ms）**：斗鱼 `stun.douyucdn.cn:18000`、芒果 TV `stun.hitv.com:3478`、小米 `stun.miwifi.com:3478`、哔哩哔哩 `stun.chat.bilibili.com:3478`
+  - **其余默认禁用（按需点击开启）**：腾讯 `stun.qq.com:3478`、Cloudflare（`443` / `3478`）、Google（`stun` / `stun1` / `stun2` / `stun3` / `stun4.l.google.com:19302`）、Twilio `global.stun.twilio.com:3478`、BlackBerry `stun.voip.blackberry.com:3478`、Nextcloud `stun.nextcloud.com:443`、Syncthing `stun.syncthing.net:3478`、Sipgate `stun.sipgate.net:3478`、StunProtocol `stunserver.stunprotocol.org:3478`
 - **纯净控制**：当「打开 STUN」关闭，或某条 STUN 在卡片中被禁用/删除时，即便是 Cloudflare TURN API 返回的自带 STUN 也会被自动剔除，确保下发列表与卡片启用项完全一致。
 - **Origin 白名单卡片**：同样支持卡片式新增、单条启用/禁用和删除（同源访问时无需填写）。
 

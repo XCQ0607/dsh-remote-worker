@@ -1,4 +1,4 @@
-import { defaultStunServers, type StunServer } from './stun.js'
+import { DEFAULT_MAX_ENABLED_STUN, defaultStunServers, type StunServer } from './stun.js'
 
 /** Runtime settings: wrangler `vars` (DSH_*) provide defaults; the admin dashboard overrides them (stored in the DO). */
 export interface OriginRule {
@@ -18,6 +18,8 @@ export interface Settings {
   p2pEnabled: boolean
   /** 打开 STUN：用于 P2P NAT 穿透，关闭后不下发任何 STUN（含 TURN 凭据自带的）。 */
   stunEnabled: boolean
+  /** 同时启用的 STUN 上限，避免过长导致 ICE 收集超 12 秒退回 Relay。 */
+  maxEnabledStun: number
   /** 启用 TURN：P2P 打洞失败时使用 Cloudflare TURN 中继（默认开）。 */
   turnEnabled: boolean
   turnTtlSeconds: number
@@ -28,13 +30,19 @@ export interface Settings {
   originRules: OriginRule[]
   /** 由 originRules 中已启用项派生，供 CORS / Origin 校验使用。 */
   allowedOrigins: string[]
+  /** OAuth 自动注册允许的邮箱/域名白名单（空数组表示不限制）。 */
+  oauthAllowedDomains: string[]
+  /** OAuth 自动注册禁止的邮箱/域名黑名单。 */
+  oauthBlockedDomains: string[]
+  /** 是否要求新用户注册时提供邀请码（仅管理员可生成）。 */
+  requireInviteCode: boolean
 }
 
 type EnvLike = Record<string, unknown>
 const RANGES: Record<string, [number, number]> = {
   heartbeatMs: [5000, 120_000], helloTimeoutMs: [1000, 60_000], heartbeatDisconnectMs: [15_000, 600_000],
   maxFramesPerSec: [64, 65_536], maxConnections: [8, 1024], maxDevicesPerAccount: [1, 4096],
-  sessionHours: [1, 720], turnTtlSeconds: [60, 3600],
+  sessionHours: [1, 720], turnTtlSeconds: [60, 3600], maxEnabledStun: [1, 16],
 }
 const STUN_RE = /^stuns?:[^\s]+$/i
 const ORIGIN_RE = /^https?:\/\/[^\s/]+$/i
@@ -82,7 +90,7 @@ function mergeStunFromUrls(urls: string[], includeBuiltins: boolean, cfEnabled?:
   }
   for (const u of urls) if (STUN_RE.test(u)) push({ url: u, label: '自定义', enabled: true })
   if (includeBuiltins) {
-    for (const s of defaultStunServers(true)) {
+    for (const s of defaultStunServers()) {
       if (cfEnabled === false && s.url.includes('stun.cloudflare.com')) push({ ...s, enabled: false })
       else push(s)
     }
@@ -123,6 +131,7 @@ export function defaultSettings(env: EnvLike): Settings {
     sessionHours: env.DSH_SESSION_HOURS,
     p2pEnabled: env.DSH_P2P_ENABLED !== 'false',
     stunEnabled: env.DSH_STUN_ENABLED !== 'false',
+    maxEnabledStun: env.DSH_MAX_ENABLED_STUN,
     turnEnabled: env.DSH_TURN_ENABLED !== 'false',
     turnTtlSeconds: env.TURN_TTL_SECONDS ?? env.DSH_TURN_TTL_SECONDS,
     stunServers: mergeStunFromUrls(customStun, includePublic),
@@ -130,8 +139,10 @@ export function defaultSettings(env: EnvLike): Settings {
     originRules,
   }, {
     heartbeatMs: 25_000, helloTimeoutMs: 5000, heartbeatDisconnectMs: 75_000, maxFramesPerSec: 512, maxConnections: 256,
-    maxDevicesPerAccount: 256, sessionHours: 8, p2pEnabled: true, stunEnabled: true, turnEnabled: true, turnTtlSeconds: 300,
-    stunServers: defaultStunServers(true), siteName: 'DSH Remote', originRules: [], allowedOrigins: [],
+    maxDevicesPerAccount: 256, sessionHours: 8, p2pEnabled: true, stunEnabled: true, maxEnabledStun: DEFAULT_MAX_ENABLED_STUN,
+    turnEnabled: true, turnTtlSeconds: 300,
+    stunServers: defaultStunServers(), siteName: 'DSH Remote', originRules: [], allowedOrigins: [],
+    oauthAllowedDomains: [], oauthBlockedDomains: [], requireInviteCode: false,
   })
 }
 
@@ -159,7 +170,20 @@ export function sanitize(input: Record<string, unknown>, base: Settings): Settin
     const origins = strList(input.allowedOrigins).filter(o => ORIGIN_RE.test(o))
     s.originRules = [...new Set(origins)].slice(0, 32).map(origin => ({ origin, enabled: true }))
   }
+  let enabledCount = 0
+  s.stunServers = s.stunServers.map(item => {
+    if (!item.enabled) return item
+    if (enabledCount < s.maxEnabledStun) { enabledCount++; return item }
+    return { ...item, enabled: false }
+  })
   s.allowedOrigins = s.originRules.filter(r => r.enabled).map(r => r.origin)
   s.siteName = typeof input.siteName === 'string' && input.siteName.trim() ? input.siteName.trim().slice(0, 40) : base.siteName
+  s.oauthAllowedDomains = input.oauthAllowedDomains !== undefined
+    ? [...new Set(strList(input.oauthAllowedDomains).map(d => d.toLowerCase().replace(/^@/, '')).filter(Boolean))].slice(0, 64)
+    : base.oauthAllowedDomains
+  s.oauthBlockedDomains = input.oauthBlockedDomains !== undefined
+    ? [...new Set(strList(input.oauthBlockedDomains).map(d => d.toLowerCase().replace(/^@/, '')).filter(Boolean))].slice(0, 64)
+    : base.oauthBlockedDomains
+  s.requireInviteCode = boolFlag(input.requireInviteCode, base.requireInviteCode)
   return s
 }

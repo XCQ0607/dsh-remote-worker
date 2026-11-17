@@ -5,3 +5,4 @@ deploy-output.json
 env.json
 /sources
 /dev
+provider.json

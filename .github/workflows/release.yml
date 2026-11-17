@@ -160,7 +160,7 @@ jobs:
           rsync -a "${EXCLUDES[@]}" worker "stage/${NAME}-${VERSION}/"
           mkdir -p "stage/${NAME}-${VERSION}/scripts"
           cp scripts/deploy.mjs "stage/${NAME}-${VERSION}/scripts/"
-          cp package.json env-template.json README.md LICENSE changelog.md "stage/${NAME}-${VERSION}/"
+          cp package.json env-template.json provider-template.json README.md LICENSE changelog.md "stage/${NAME}-${VERSION}/"; mkdir -p "stage/${NAME}-${VERSION}/md"; cp md/oauth.md "stage/${NAME}-${VERSION}/md/"
 
           # 2) 完整源码包：在上面的基础上再加 web/ 前端源码与 .github 工作流
           rsync -a "stage/${NAME}-${VERSION}/" "stage/${NAME}-${VERSION}-src/"

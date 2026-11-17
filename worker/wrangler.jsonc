@@ -26,6 +26,7 @@
     "DSH_TURN_ENABLED": "true",
     "DSH_TURN_TTL_SECONDS": "300",
     "DSH_STUN_ENABLED": "true",
+    "DSH_MAX_ENABLED_STUN": "6",
     "DSH_STUN_URLS": "",
     "DSH_ALLOWED_ORIGINS": "",
     "DSH_DO_LOCATION": ""

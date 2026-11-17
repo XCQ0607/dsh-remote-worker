@@ -6,13 +6,13 @@ export class ApiError extends Error {
   constructor(readonly code: string, readonly status = 400) { super(code) }
 }
 
-export interface AccountRecord { email: string; salt: string; verifier: string }
+export interface AccountRecord { email: string; salt: string; verifier: string; disabled?: boolean; maxDevices?: number }
 export interface SavedDevice { account: string; descriptor: AccountDeviceDescriptor; revoked: boolean; lastSeenAt: number }
 interface SavedToken {
   kind: 'access' | 'refresh'; deviceId: string; expires: number; used: boolean
   recovery?: { nonce: string; accessExpires: number }
 }
-export interface SavedSession { account: string; expires: number }
+export interface SavedSession { account: string; expires: number; id?: string; ua?: string; created?: number }
 export const normEmail = (e: string): string => e.trim().toLowerCase()
 
 async function successor(token: string, nonce: string, deviceId: string) {
@@ -55,11 +55,26 @@ export class Store {
   async upsertAccount(email: string, password: string): Promise<void> {
     const e = normEmail(email)
     if (!e || e.length > 254 || password.length < 12 || password.length > 1024) throw new ApiError('INVALID_MESSAGE')
+    const prev = await this.getAccount(e)
     const salt = secret()
-    const rec: AccountRecord = { email: e, salt, verifier: await pbkdf2(password, salt) }
+    const rec: AccountRecord = { email: e, salt, verifier: await pbkdf2(password, salt), disabled: prev?.disabled, maxDevices: prev?.maxDevices }
     await this.s.put(`acct:${e}`, rec)
     this.acctCache.set(e, rec)
     await this.deleteSessions(e)
+  }
+  async setAccountMeta(email: string, meta: { disabled?: boolean; maxDevices?: number | null }): Promise<void> {
+    const e = normEmail(email)
+    const prev = await this.getAccount(e)
+    if (!prev) throw new ApiError('NOT_FOUND', 404)
+    const rec: AccountRecord = { ...prev }
+    if (meta.disabled !== undefined) rec.disabled = meta.disabled
+    if (meta.maxDevices !== undefined) {
+      if (meta.maxDevices === null || meta.maxDevices <= 0) delete rec.maxDevices
+      else rec.maxDevices = meta.maxDevices
+    }
+    await this.s.put(`acct:${e}`, rec)
+    this.acctCache.set(e, rec)
+    if (rec.disabled) await this.deleteSessions(e)
   }
   async deleteAccount(email: string): Promise<void> {
     const e = normEmail(email)
@@ -72,17 +87,47 @@ export class Store {
     const acct = await this.getAccount(email)
     const verifier = await pbkdf2(password, acct?.salt ?? 'x'.repeat(43)) // dummy work when unknown
     if (!acct || !(await equal(verifier, acct.verifier))) throw new ApiError('AUTH_INVALID', 401)
+    if (acct.disabled) throw new ApiError('ACCOUNT_DISABLED', 403)
     return acct.email
   }
 
   // ---- sessions (web login) ----
-  async createSession(account: string): Promise<{ value: string; expiresAt: number }> {
+  async createSession(account: string, ua = ''): Promise<{ value: string; expiresAt: number }> {
     const value = secret(), expiresAt = Date.now() + this.sessionHours * 3600_000
-    const ses: SavedSession = { account, expires: expiresAt }
+    const ses: SavedSession = { account, expires: expiresAt, id: secret().slice(0, 12), ua: ua.slice(0, 160), created: Date.now() }
     const key = `ses:${await hash(value)}`
     this.sesCache.set(key, ses)
     await this.s.put(key, ses)
     return { value, expiresAt }
+  }
+  async listSessions(account: string): Promise<Array<{ id: string; ua: string; created: number; expires: number }>> {
+    const now = Date.now()
+    const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
+    const out: Array<{ id: string; ua: string; created: number; expires: number }> = []
+    for (const [k, v] of all) {
+      if (v.expires <= now) { this.sesCache.delete(k); await this.s.delete(k); continue }
+      if (v.account === account) out.push({ id: v.id ?? k.slice(4, 16), ua: v.ua ?? '', created: v.created ?? 0, expires: v.expires })
+    }
+    return out.sort((a, b) => b.created - a.created)
+  }
+  async deleteSessionById(account: string, id: string): Promise<boolean> {
+    const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
+    for (const [k, v] of all) {
+      if (v.account === account && (v.id === id || k.slice(4, 16) === id)) {
+        this.sesCache.delete(k)
+        await this.s.delete(k)
+        return true
+      }
+    }
+    return false
+  }
+  async cleanupExpiredSessions(): Promise<number> {
+    const now = Date.now()
+    const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
+    const expired = [...all].filter(([, v]) => v.expires <= now).map(([k]) => k)
+    for (const k of expired) this.sesCache.delete(k)
+    if (expired.length) await this.s.delete(expired)
+    return expired.length
   }
   async session(token: string): Promise<string> {
     const key = `ses:${await hash(token)}`

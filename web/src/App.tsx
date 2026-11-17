@@ -1,15 +1,24 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { Activity, KeyRound, LayoutDashboard, Link2, LogOut, Moon, Radio, ScrollText, Server, Settings, Sun, Users } from 'lucide-react'
+import { Activity, KeyRound, LayoutDashboard, Link2, LogOut, Moon, Radio, ScrollText, Server, Settings, Sun, Ticket, User, Users, Wifi } from 'lucide-react'
 import { api } from './api'
 import { ToastCtx } from './toast'
-import { Accounts, AllDevices, Events, Links, MyDevices, Overview, SettingsPage, Turn } from './pages'
+import { ProviderIcon } from './ui'
+import { Accounts, AllDevices, Events, InvitesPage, Links, MyDevices, NetworkPage, OAuth, Overview, ProfilePage, SettingsPage, Turn } from './pages'
 
 type Toast = { id: number; kind: 's' | 'e'; text: string }
 type Me = { account: string; isAdmin: boolean }
 
 const ADMIN_TABS = [
   ['overview', '概览', LayoutDashboard, Overview], ['devices', '全部设备', Server, AllDevices], ['accounts', '账号管理', Users, Accounts],
-  ['links', '实时连接', Link2, Links], ['turn', 'TURN 中转', Radio, Turn], ['settings', '系统设置', Settings, SettingsPage], ['events', '审计日志', ScrollText, Events],
+  ['links', '实时连接', Link2, Links], ['turn', 'TURN 中转', Radio, Turn], ['settings', '系统设置', Settings, SettingsPage],
+  ['oauth', 'OAuth 登录', KeyRound, OAuth], ['invites', '邀请码', Ticket, InvitesPage], ['events', '审计日志', ScrollText, Events],
+  ['profile', '个人中心', User, ProfilePage], ['network', '网络诊断', Wifi, NetworkPage],
+] as const
+
+const USER_TABS = [
+  ['devices', '我的设备', Activity, MyDevices],
+  ['profile', '个人中心', User, ProfilePage],
+  ['network', '网络诊断', Wifi, NetworkPage],
 ] as const
 
 const GhIcon = () => (
@@ -25,10 +34,44 @@ const CopyRight = () => (
 
 function Login({ onDone }: { onDone: () => void }) {
   const [email, setEmail] = useState(''), [password, setPassword] = useState(''), [err, setErr] = useState(''), [busy, setBusy] = useState(false)
+  const [oauth, setOauth] = useState<{ id: string; displayName: string; startUrl: string }[]>([])
+  const [invToken, setInvToken] = useState(() => new URLSearchParams(location.search).get('oauth_invite') ?? '')
+  const [invCode, setInvCode] = useState('')
+  const [qrDone, setQrDone] = useState(false)
+  useEffect(() => {
+    api('/api/v1/auth/oauth/providers').then(r => setOauth(r.items ?? [])).catch(() => { })
+    const sp = new URLSearchParams(location.search)
+    const e = sp.get('oauth_error')
+    if (e) { setErr(e === 'OAUTH_REGISTER_DISABLED' ? '该登录方式未开放注册，请联系管理员' : `第三方登录失败: ${e}`); history.replaceState(null, '', '/') }
+    if (sp.get('oauth_invite')) history.replaceState(null, '', '/')
+  }, [])
   const go = async () => {
     setBusy(true); setErr('')
     try { await api('/api/v1/auth/login', { body: { email, password } }); onDone() } catch { setErr('账号或密码错误') } finally { setBusy(false) }
   }
+  const submitInvite = async () => {
+    setBusy(true); setErr('')
+    try {
+      const r = await api('/api/v1/auth/oauth/invite', { method: 'POST', body: { token: invToken, code: invCode.trim() } })
+      if (r.qr) setQrDone(true)
+      else onDone()
+    } catch (e: any) { setErr(e.message || '邀请码无效或已过期') } finally { setBusy(false) }
+  }
+  if (qrDone) return (
+    <div className="login"><div className="card" style={{ textAlign: 'center' }}>
+      <h2>授权成功</h2><p className="sub">已完成注册并授权，请关闭此页面并返回客户端继续。</p>
+    </div></div>
+  )
+  if (invToken) return (
+    <div className="login"><div className="card">
+      <img src="/favicon.svg" alt="DSH Remote" style={{ display: 'block', margin: '0 auto', width: 48, height: 48 }} />
+      <h1>需要邀请码</h1><p className="sub" style={{ textAlign: 'center' }}>首次使用第三方账号注册，请输入邀请码</p>
+      <div className="field"><label>邀请码</label><input value={invCode} onChange={e => setInvCode(e.target.value)} placeholder="请输入邀请码" onKeyDown={e => e.key === 'Enter' && submitInvite()} /></div>
+      {err && <p className="hint" style={{ color: 'var(--bad)' }}>{err}</p>}
+      <button className="btn pri" style={{ width: '100%', justifyContent: 'center' }} disabled={busy || !invCode.trim()} onClick={submitInvite}>验证并完成注册</button>
+      <button className="btn" style={{ width: '100%', justifyContent: 'center', marginTop: 10 }} onClick={() => setInvToken('')}>返回登录</button>
+    </div></div>
+  )
   return (
     <div className="login"><div className="card">
       <img src="/favicon.svg" alt="DSH Remote" style={{ display: 'block', margin: '0 auto', width: 48, height: 48 }} />
@@ -37,6 +80,7 @@ function Login({ onDone }: { onDone: () => void }) {
       <div className="field"><label>密码</label><input type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" onKeyDown={e => e.key === 'Enter' && go()} /></div>
       {err && <p className="hint" style={{ color: 'var(--bad)' }}>{err}</p>}
       <button className="btn pri" style={{ width: '100%', justifyContent: 'center' }} disabled={busy || !email || !password} onClick={go}>登录</button>
+      {oauth.map(p => <a key={p.id} className="btn" style={{ width: '100%', justifyContent: 'center', marginTop: 10, boxSizing: 'border-box', textDecoration: 'none' }} href={p.startUrl}><ProviderIcon id={p.id} size={16} />使用 {p.displayName} 登录</a>)}
       <p className="hint" style={{ textAlign: 'center', marginTop: 16 }}><CopyRight /></p>
     </div></div>
   )
@@ -68,7 +112,8 @@ export function App() {
   if (me === undefined) body = null
   else if (me === null) body = <Login onDone={load} />
   else {
-    const Page = (me.isAdmin ? ADMIN_TABS.find(t => t[0] === tab)?.[3] : undefined) ?? (me.isAdmin ? Overview : MyDevices)
+    const tabs = me.isAdmin ? ADMIN_TABS : USER_TABS
+    const Page = (tabs.find(t => t[0] === tab)?.[3] ?? tabs[0][3]) as () => ReactNode
     body = (
       <div className="app">
         <aside className="side">
@@ -80,9 +125,9 @@ export function App() {
             </div>
           </div>
           <nav className="side-nav" ref={navRef}>
-            {me.isAdmin ? ADMIN_TABS.map(([id, label, Icon]) => (
+            {(me.isAdmin ? ADMIN_TABS : USER_TABS).map(([id, label, Icon]) => (
               <button key={id} className={`nav ${tab === id ? 'on' : ''}`} onClick={() => setTab(id)}><Icon size={18} /><span>{label}</span></button>
-            )) : <button className="nav on"><Activity size={18} /><span>我的设备</span></button>}
+            ))}
           </nav>
           <div className="grow side-foot-spacer" />
           <div className="side-foot">

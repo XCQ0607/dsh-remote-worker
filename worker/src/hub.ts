@@ -7,7 +7,8 @@ import {
   type SecureHandshakePayload, type TransportSelectedPayload,
 } from './protocol/index.js'
 import { ApiError, Store, normEmail, type SavedDevice } from './store.js'
-import { equal, hash } from './crypto.js'
+import { equal, hash, secret } from './crypto.js'
+import { authorizeUrl, fetchEmail, loadProviders, type ProviderCfg } from './oauth.js'
 import { createTurnKey, clearIceCache, fetchIceServers, listTurnKeys, type CfAuth, type TurnKey } from './ice.js'
 import { defaultStunServers, resolveStunUrls } from './stun.js'
 import { defaultSettings, sanitize, type Settings } from './settings.js'
@@ -20,6 +21,7 @@ export interface Env {
   TURN_KEY_API_TOKEN?: string
   TURN_TTL_SECONDS?: string
   ADMIN_ACCOUNTS?: string
+  OAUTH_PROVIDERS?: string
   DSH_DO_LOCATION?: string
   [key: string]: unknown
 }
@@ -53,6 +55,8 @@ export class Hub extends DurableObject<Env> {
   private turn?: TurnKey
   private startedAt = Date.now()
   private events: { t: number; type: string; detail: string; actor: string }[] = []
+  private admins = new Set<string>()
+  private oauthCustom: Record<string, ProviderCfg> = {}
   private links: Record<string, Link> = {}
   private dropped = new Map<string, Dropped>()
   private counters = new Map<string, Map<string, number>>() // relay counters (memory only; Noise protects replays)
@@ -82,6 +86,8 @@ export class Hub extends DurableObject<Env> {
       this.store.maxDevices = this.cfg.maxDevicesPerAccount
       this.turn = (await ctx.storage.get<TurnKey>('turn')) ?? this.turn
       this.events = (await ctx.storage.get<typeof this.events>('events')) ?? []
+      this.admins = new Set((await ctx.storage.get<string[]>('admins')) ?? [])
+      this.oauthCustom = (await ctx.storage.get<Record<string, ProviderCfg>>('oauth_custom')) ?? {}
     })
   }
 
@@ -230,7 +236,266 @@ export class Hub extends DurableObject<Env> {
       await this.log('login', ip, account)
       return json(200, { ...profile(account), token: s.value, expiresAt: s.expiresAt }, { 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) })
     }
-    if (method === 'GET' && path === '/api/v1/auth/me') return json(200, profile(await this.store.session(this.bearer(req))))
+    if (method === 'GET' && path === '/api/v1/auth/me') {
+      const a = await this.store.session(this.bearer(req))
+      return json(200, { ...profile(a), oauthInit: !!(await this.ctx.storage.get(`oauthpw:${normEmail(a)}`)) })
+    }
+    if (method === 'GET' && path === '/api/v1/network/ping') {
+      return json(200, { ok: true, ts: Date.now(), stunServers: this.cfg.stunServers.filter(s => s.enabled).map(s => s.url) })
+    }
+    if (method === 'GET' && path === '/api/v1/account/profile') {
+      const a = await this.accountAuth(req)
+      const acct = await this.store.getAccount(a)
+      const oauthInit = !!(await this.ctx.storage.get(`oauthpw:${normEmail(a)}`))
+      const sessions = await this.store.listSessions(a)
+      return json(200, {
+        email: a, isAdmin: this.isAdminAccount(a), hasPassword: !oauthInit,
+        disabled: !!acct?.disabled, maxDevices: acct?.maxDevices ?? this.cfg.maxDevicesPerAccount,
+        sessions,
+      })
+    }
+    if (method === 'POST' && path === '/api/v1/account/password') {
+      const a = await this.accountAuth(req)
+      const b = await this.body(req) as { currentPassword?: unknown; newPassword?: unknown }
+      const newPw = typeof b.newPassword === 'string' ? b.newPassword : ''
+      if (newPw.length < 12 || newPw.length > 1024) throw new ApiError('INVALID_MESSAGE')
+      const oauthInit = !!(await this.ctx.storage.get(`oauthpw:${normEmail(a)}`))
+      if (!oauthInit) {
+        const cur = typeof b.currentPassword === 'string' ? b.currentPassword : ''
+        await this.store.verifyLogin(a, cur)
+      }
+      await this.store.upsertAccount(a, newPw)
+      if (oauthInit) await this.ctx.storage.delete(`oauthpw:${normEmail(a)}`)
+      await this.log('account.password.changed', a, a)
+      return json(200, { ok: true })
+    }
+    if (method === 'GET' && path === '/api/v1/account/sessions') {
+      const a = await this.accountAuth(req)
+      return json(200, { items: await this.store.listSessions(a) })
+    }
+    const sesDel = /^\/api\/v1\/account\/sessions\/([A-Za-z0-9_-]{6,32})$/.exec(path)
+    if (method === 'DELETE' && sesDel) {
+      const a = await this.accountAuth(req)
+      await this.store.deleteSessionById(a, sesDel[1]!)
+      return json(200, { ok: true })
+    }
+    if (method === 'GET' && path === '/api/v1/account/host-registration-codes') {
+      const a = await this.accountAuth(req)
+      const now = Date.now()
+      const all = await this.ctx.storage.list<{ account: string; code: string; registrationId: string; expiresAt: number }>({ prefix: 'hostcode:' })
+      const items = [...all.values()].filter(v => v.account === a && v.expiresAt > now).sort((x, y) => y.expiresAt - x.expiresAt)
+      return json(200, { items })
+    }
+    if (method === 'POST' && path === '/api/v1/account/host-registration-codes') {
+      const a = await this.accountAuth(req)
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+      const pick = (n: number) => Array.from(crypto.getRandomValues(new Uint8Array(n)), x => chars[x % chars.length]).join('')
+      const code = `${pick(4)}-${pick(4)}`
+      const registrationId = crypto.randomUUID()
+      const expiresAt = Date.now() + 600_000
+      const rec = { account: a, code, registrationId, expiresAt }
+      await this.ctx.storage.put(`hostcode:${code}`, rec)
+      await this.ensureAlarm(600_000)
+      return json(200, rec)
+    }
+    const hcDel = /^\/api\/v1\/account\/host-registration-codes\/([^/]+)$/.exec(path)
+    if (method === 'DELETE' && hcDel) {
+      const a = await this.accountAuth(req)
+      const id = decodeURIComponent(hcDel[1]!)
+      const all = await this.ctx.storage.list<{ account: string; code: string; registrationId: string }>({ prefix: 'hostcode:' })
+      for (const [k, v] of all) {
+        if (v.account === a && (v.registrationId === id || v.code === id)) await this.ctx.storage.delete(k)
+      }
+      return json(200, { ok: true })
+    }
+    const devPatch = /^\/api\/v1\/account\/devices\/([^/]+)$/.exec(path)
+    if (method === 'PATCH' && devPatch) {
+      const a = await this.accountAuth(req)
+      const id = decodeURIComponent(devPatch[1]!)
+      const b = await this.body(req) as { displayName?: unknown }
+      const name = typeof b.displayName === 'string' ? b.displayName.trim().slice(0, 64) : ''
+      if (!name) throw new ApiError('INVALID_MESSAGE')
+      await this.store.rename(a, id, name)
+      return json(200, { ok: true })
+    }
+    if (path === '/api/v1/account/webhooks') {
+      const a = await this.accountAuth(req)
+      if (method === 'GET') return json(200, { items: await this.getWebhooks(a) })
+      if (method === 'POST') {
+        const b = z.object({
+          id: z.string().trim().max(32).optional(),
+          name: z.string().trim().max(64).optional(),
+          url: z.string().trim().url().max(512),
+          enabled: z.boolean().optional(),
+          events: z.array(z.enum(['host_offline', 'device_registered'])).optional(),
+          deviceIds: z.array(z.string().trim().max(128)).max(64).optional(),
+        }).parse(await this.body(req))
+        const list = await this.getWebhooks(a)
+        const id = b.id || secret().slice(0, 10)
+        const item = { id, name: b.name || 'Webhook', url: b.url, enabled: b.enabled ?? true, events: b.events ?? ['host_offline', 'device_registered'], deviceIds: (b.deviceIds ?? []).filter(Boolean) }
+        const idx = list.findIndex(x => x.id === id)
+        if (idx >= 0) list[idx] = item; else list.push(item)
+        await this.ctx.storage.put(`webhooks:${a}`, list)
+        return json(200, item)
+      }
+    }
+    const whDel = /^\/api\/v1\/account\/webhooks\/([A-Za-z0-9_-]{1,32})$/.exec(path)
+    if (method === 'DELETE' && whDel) {
+      const a = await this.accountAuth(req)
+      const list = (await this.getWebhooks(a)).filter(x => x.id !== whDel[1])
+      await this.ctx.storage.put(`webhooks:${a}`, list)
+      return json(200, { ok: true })
+    }
+    if (method === 'POST' && path === '/api/v1/account/webhooks/test') {
+      const a = await this.accountAuth(req)
+      const b = (await this.body(req).catch(() => ({}))) as { id?: string }
+      const list = await this.getWebhooks(a)
+      const target = b?.id ? list.find(x => x.id === b.id) : list[0]
+      if (!target) throw new ApiError('WEBHOOK_NOT_FOUND', 404)
+      const res = await this.sendOneWebhook(target.url, a, 'device_registered', { test: true, message: 'DSH Remote Webhook 测试通知' })
+      if (!res.ok) return json(400, { error: { code: 'WEBHOOK_FAILED', message: res.error ?? 'Webhook 请求失败' } })
+      return json(200, res)
+    }
+    // ---- OAuth login (providers from provider.json -> OAUTH_PROVIDERS secret) ----
+    if (method === 'GET' && path === '/api/v1/auth/oauth/providers') {
+      const ov = await this.oauthOverrides()
+      return json(200, {
+        items: loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom)
+          .filter(p => ov[p.id]?.enabled ?? p.enabled)
+          .map(p => ({ id: p.id, displayName: p.displayName, startUrl: `/api/v1/auth/oauth/${p.id}/start`, qrStartUrl: `/api/v1/auth/oauth/qr/start?provider=${p.id}` })),
+      })
+    }
+    if (path === '/api/v1/auth/oauth/qr/start' && (method === 'POST' || method === 'GET')) {
+      this.limit(`oauth:${ip}`, 30)
+      const pid = url.searchParams.get('provider') ?? ''
+      const p = loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).find(x => x.id === pid)
+      const ov = p ? (await this.oauthOverrides())[p.id] : undefined
+      if (!p || !(ov?.enabled ?? p.enabled)) throw new ApiError('OAUTH_DISABLED', 400)
+      const qrId = secret().slice(0, 24)
+      await this.ctx.storage.put(`qr:${qrId}`, { id: p.id, exp: Date.now() + 600_000, status: 'pending' })
+      return json(200, { qrId, scanUrl: `${url.origin}/api/v1/auth/q/${qrId}`, expiresIn: 600, provider: p.id })
+    }
+    const qrPoll = /^\/api\/v1\/auth\/oauth\/qr\/([A-Za-z0-9_-]{8,64})$/.exec(path)
+    if (method === 'GET' && (qrPoll || path === '/api/v1/auth/oauth/qr/status' || path === '/api/v1/auth/oauth/qr/poll')) {
+      const qrId = qrPoll ? qrPoll[1]! : (url.searchParams.get('qrId') ?? '')
+      const q = qrId ? await this.ctx.storage.get<{ id: string; exp: number; status: string; token?: string; account?: string; expiresAt?: number }>(`qr:${qrId}`) : undefined
+      if (!q || q.exp < Date.now()) { if (q) await this.ctx.storage.delete(`qr:${qrId}`); return json(200, { status: 'expired' }) }
+      if (q.status === 'confirmed' || q.status === 'complete') { await this.ctx.storage.delete(`qr:${qrId}`); return json(200, { status: 'complete', token: q.token, account: q.account, expiresAt: q.expiresAt }) }
+      return json(200, { status: 'pending' })
+    }
+    const qm = /^\/api\/v1\/auth\/q\/([A-Za-z0-9_-]{8,64})$/.exec(path)
+    if (method === 'GET' && qm) {
+      this.limit(`oauth:${ip}`, 30)
+      const q = await this.ctx.storage.get<{ id: string; exp: number; status: string }>(`qr:${qm[1]}`)
+      if (!q || q.exp < Date.now()) return new Response('QR expired', { status: 410 })
+      const p = loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).find(x => x.id === q.id)
+      if (!p) return new Response('OAuth not configured', { status: 400 })
+      if (!q || q.exp < Date.now()) return new Response('QR expired', { status: 410 })
+      const state = secret(), secure = url.protocol === 'https:' ? '; Secure' : ''
+      await this.ctx.storage.put(`ostate:${await hash(state)}`, { id: p.id, exp: Date.now() + 600_000, qrId: qm[1] })
+      return new Response(null, { status: 302, headers: { Location: authorizeUrl(p, `${url.origin}/api/v1/auth/oauth/${p.id}/callback`, state), 'Set-Cookie': `dsh_oauth=${state}; Path=/api/v1/auth/oauth; HttpOnly; SameSite=Lax; Max-Age=600${secure}` } })
+    }
+    if (method === 'POST' && path === '/api/v1/auth/oauth/invite') {
+      this.limit(`oauth:${ip}`, 30)
+      const ct = req.headers.get('content-type') ?? ''
+      let raw: { token?: string; code?: string }
+      if (ct.includes('application/x-www-form-urlencoded')) {
+        const fd = new URLSearchParams(await req.text())
+        raw = { token: fd.get('token') ?? '', code: fd.get('code') ?? '' }
+      } else {
+        raw = (await this.body(req)) as { token?: string; code?: string }
+      }
+      const b = z.object({ token: z.string().min(16).max(64), code: z.string().trim().min(4).max(32) }).parse(raw)
+      const pending = await this.ctx.storage.get<{ email: string; providerId: string; qrId?: string; exp: number }>(`oinvite:${b.token}`)
+      if (!pending || pending.exp < Date.now()) throw new ApiError('INVITE_SESSION_EXPIRED', 400)
+      const invCode = b.code.toUpperCase().replace(/[^A-Z0-9_-]/g, '')
+      const inv = await this.ctx.storage.get<{ code: string; maxUses: number; uses: number; expiresAt: number; usedBy?: Array<{ email: string; at: number }> }>(`invite:${invCode}`)
+      if (!inv || (inv.expiresAt > 0 && inv.expiresAt < Date.now()) || inv.uses >= inv.maxUses) throw new ApiError('INVITE_INVALID', 400)
+      inv.uses += 1
+      inv.usedBy = [...(inv.usedBy ?? []), { email: pending.email, at: Date.now() }]
+      await this.ctx.storage.put(`invite:${invCode}`, inv)
+      await this.ctx.storage.delete(`oinvite:${b.token}`)
+      if (!(await this.store.getAccount(pending.email))) {
+        await this.store.upsertAccount(pending.email, secret())
+        await this.ctx.storage.put(`oauthpw:${pending.email}`, true)
+        await this.log('oauth.register', `${pending.providerId} ${pending.email} invite:${invCode}`, pending.email)
+      }
+      const s = await this.store.createSession(pending.email, req.headers.get('user-agent') ?? '')
+      await this.log('login', `oauth:${pending.providerId} ${ip}`, pending.email)
+      if (pending.qrId) {
+        const q = await this.ctx.storage.get<{ id: string; exp: number }>(`qr:${pending.qrId}`)
+        if (q && q.exp >= Date.now()) await this.ctx.storage.put(`qr:${pending.qrId}`, { ...q, status: 'confirmed', token: s.value, account: pending.email, expiresAt: s.expiresAt })
+        if (ct.includes('application/x-www-form-urlencoded')) {
+          return new Response('<!doctype html><meta charset="utf-8"><title>授权成功</title><body style="font-family:sans-serif;display:grid;place-items:center;min-height:100vh;background:#0b0d12;color:#e8ebf2"><div style="text-align:center"><h2>授权成功</h2><p>已完成注册并授权，请关闭此页面并返回客户端继续。</p></div></body>', { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+        }
+        return json(200, { ok: true, qr: true })
+      }
+      if (ct.includes('application/x-www-form-urlencoded')) {
+        return new Response(null, { status: 302, headers: { Location: '/', 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) } })
+      }
+      return json(200, { ok: true, qr: false }, { 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) })
+    }
+    const oa = /^\/api\/v1\/auth\/oauth\/([a-z0-9_-]+)\/(start|callback)$/.exec(path)
+    if (method === 'GET' && oa) {
+      this.limit(`oauth:${ip}`, 30)
+      const fail = (code: string) => new Response(null, { status: 302, headers: { Location: `/?oauth_error=${code}` } })
+      const p = loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).find(x => x.id === oa[1])
+      const ov = p ? (await this.oauthOverrides())[p.id] : undefined
+      if (!p || !(ov?.enabled ?? p.enabled)) return fail('OAUTH_DISABLED')
+      const redirect = `${url.origin}/api/v1/auth/oauth/${p.id}/callback`
+      const secure = url.protocol === 'https:' ? '; Secure' : ''
+      if (oa[2] === 'start') {
+        const state = secret()
+        await this.ctx.storage.put(`ostate:${await hash(state)}`, { id: p.id, exp: Date.now() + 600_000 })
+        return new Response(null, { status: 302, headers: { Location: authorizeUrl(p, redirect, state), 'Set-Cookie': `dsh_oauth=${state}; Path=/api/v1/auth/oauth; HttpOnly; SameSite=Lax; Max-Age=600${secure}` } })
+      }
+      const state = url.searchParams.get('state') ?? '', code = url.searchParams.get('code') ?? ''
+      const ck = /(?:^|;\s*)dsh_oauth=([A-Za-z0-9_-]+)/.exec(req.headers.get('cookie') ?? '')?.[1]
+      const sk = `ostate:${await hash(state)}`
+      const saved = await this.ctx.storage.get<{ id: string; exp: number; qrId?: string }>(sk)
+      await this.ctx.storage.delete(sk)
+      if (!code || !saved || saved.id !== p.id || saved.exp < Date.now() || ck !== state) return fail('OAUTH_STATE_INVALID')
+      try {
+        const email = normEmail(await fetchEmail(p, code, redirect))
+        if (!(await this.store.getAccount(email))) {
+          if (!(ov?.allowRegister ?? p.allowRegister)) return fail('OAUTH_REGISTER_DISABLED')
+          const dom = email.split('@')[1] ?? ''
+          if (this.cfg.oauthBlockedDomains.includes(email) || this.cfg.oauthBlockedDomains.includes(dom)) return fail('OAUTH_EMAIL_BLOCKED')
+          if (this.cfg.oauthAllowedDomains.length && !this.cfg.oauthAllowedDomains.includes(email) && !this.cfg.oauthAllowedDomains.includes(dom)) return fail('OAUTH_DOMAIN_NOT_ALLOWED')
+          const needInvite = (ov as { requireInviteCode?: boolean } | undefined)?.requireInviteCode ?? true
+          if (needInvite) {
+            const pt = secret().slice(0, 24)
+            await this.ctx.storage.put(`oinvite:${pt}`, { email, providerId: p.id, providerName: p.displayName, qrId: saved.qrId, exp: Date.now() + 600_000 })
+            return new Response(null, { status: 302, headers: { Location: `/?oauth_invite=${encodeURIComponent(pt)}` } })
+          }
+          await this.store.upsertAccount(email, secret()) // random password; user may set their own later
+          await this.ctx.storage.put(`oauthpw:${email}`, true)
+          await this.log('oauth.register', `${p.id} ${email}`, email)
+        }
+        const s = await this.store.createSession(email)
+        await this.log('login', `oauth:${p.id} ${ip}`, email)
+        if (saved.qrId) {
+          const q = await this.ctx.storage.get<{ id: string; exp: number }>(`qr:${saved.qrId}`)
+          if (q && q.exp >= Date.now()) await this.ctx.storage.put(`qr:${saved.qrId}`, { ...q, status: 'confirmed', token: s.value, account: email, expiresAt: s.expiresAt })
+          const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>授权成功 · DSH Remote</title>
+<style>:root{color-scheme:dark light;--bg:#0b0d12;--card:rgba(255,255,255,.05);--line:rgba(255,255,255,.1);--tx:#e8ebf2;--mut:#8b93a7;--ok:#34d399;--pri:#6c8cff;--pri2:#a56bff}
+@media(prefers-color-scheme:light){:root{--bg:#f4f6fb;--card:#fff;--line:#e2e6f0;--tx:#161a25;--mut:#667089}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;font:14px/1.6 Inter,system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--tx);background-image:radial-gradient(800px 420px at 20% -10%,rgba(108,140,255,.18),transparent),radial-gradient(600px 420px at 90% 0,rgba(165,107,255,.14),transparent)}
+.card{width:100%;max-width:380px;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:32px 26px;text-align:center;backdrop-filter:blur(14px);box-shadow:0 14px 36px rgba(0,0,0,.25)}
+.ic{width:54px;height:54px;border-radius:16px;margin:0 auto 14px;display:grid;place-items:center;background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.3)}
+h2{margin:0 0 6px;font-size:20px}p{margin:0 0 18px;color:var(--mut)}.tag{display:inline-block;padding:4px 12px;border-radius:99px;background:rgba(108,140,255,.15);color:var(--pri);font-size:12px;margin-bottom:18px}
+a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:linear-gradient(135deg,var(--pri),var(--pri2));color:#fff;font-weight:600;text-decoration:none}</style></head>
+<body><div class="card"><div class="ic"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+<h2>授权成功</h2><div class="tag">${email.replace(/[<>&]/g, '')}</div><p>已完成 ${p.displayName} 账号授权，您可以直接关闭此标签页并返回客户端。</p>
+<a class="btn" href="/">进入网页管理后台</a></div></body></html>`
+          return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+        }
+        const h = new Headers({ Location: '/' })
+        h.append('Set-Cookie', this.cookie(s.value, this.cfg.sessionHours * 3600, url))
+        h.append('Set-Cookie', `dsh_oauth=; Path=/api/v1/auth/oauth; Max-Age=0${secure}`)
+        return new Response(null, { status: 302, headers: h })
+      } catch (e) { return fail(e instanceof ApiError ? e.code : 'OAUTH_FAILED') }
+    }
     if (method === 'POST' && path === '/api/v1/auth/logout') {
       await this.store.deleteSession(this.bearer(req))
       return json(200, { status: 'ok' }, { 'Set-Cookie': this.cookie('', 0, url) })
@@ -241,9 +506,11 @@ export class Hub extends DurableObject<Env> {
     }
     if (method === 'POST' && path === '/api/v1/account/password') {
       const account = await this.store.session(this.bearer(req))
-      const b = z.object({ oldPassword: z.string().min(1).max(1024), newPassword: z.string().min(12).max(1024) }).parse(await this.body(req))
-      await this.store.verifyLogin(account, b.oldPassword)
+      const b = z.object({ oldPassword: z.string().max(1024).optional(), newPassword: z.string().min(12).max(1024) }).parse(await this.body(req))
+      const mk = `oauthpw:${normEmail(account)}` // OAuth-created accounts have an unknown random password: no old password needed once
+      if (!(await this.ctx.storage.get(mk))) await this.store.verifyLogin(account, b.oldPassword ?? '')
       await this.store.upsertAccount(account, b.newPassword)
+      await this.ctx.storage.delete(mk)
       const s = await this.store.createSession(account)
       await this.log('account.password', account, account)
       return json(200, { status: 'ok', expiresAt: s.expiresAt }, { 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) })
@@ -279,7 +546,6 @@ export class Hub extends DurableObject<Env> {
       const cid = url.searchParams.get('connection_id') ?? ''
       if (!cid || cid.length > 128) throw new ApiError('INVALID_MESSAGE')
       if (!this.authorizeIce(source.descriptor.deviceId, cid)) throw new ApiError('CONNECTION_NOT_FOUND', 404)
-      // turnEnabled 只控制是否签发 TURN 凭据;STUN 由 stunEnabled / stunUsePublicList / stunUseCloudflare 三个开关解析。
       const { servers } = await fetchIceServers(this.turnOn ? this.turn : undefined, this.cfg.turnTtlSeconds, resolveStunUrls(this.cfg))
       return json(200, { iceServers: servers })
     }
@@ -312,8 +578,72 @@ export class Hub extends DurableObject<Env> {
     throw new ApiError('METHOD_NOT_FOUND', 404)
   }
 
-  private isAdminAccount(a: string): boolean {
+  private oauthOverridesCache?: Record<string, { enabled?: boolean; allowRegister?: boolean }>
+  private lastCleanupAt = 0
+
+  private async oauthOverrides(): Promise<Record<string, { enabled?: boolean; allowRegister?: boolean }>> {
+    if (!this.oauthOverridesCache) {
+      this.oauthOverridesCache = (await this.ctx.storage.get<Record<string, { enabled?: boolean; allowRegister?: boolean }>>('oauth')) ?? {}
+    }
+    return this.oauthOverridesCache
+  }
+  private async getWebhooks(account: string): Promise<Array<{ id: string; name: string; url: string; enabled: boolean; events: string[]; deviceIds: string[] }>> {
+    const list = await this.ctx.storage.get<Array<{ id: string; name: string; url: string; enabled: boolean; events: string[]; deviceIds: string[] }>>(`webhooks:${account}`)
+    if (list) return list
+    const legacy = await this.ctx.storage.get<{ url: string; enabled: boolean; events: string[]; deviceIds?: string[] }>(`webhook:${account}`)
+    if (legacy?.url) return [{ id: 'default', name: '默认 Webhook', url: legacy.url, enabled: legacy.enabled, events: legacy.events ?? ['host_offline', 'device_registered'], deviceIds: legacy.deviceIds ?? [] }]
+    return []
+  }
+  private async sendOneWebhook(url: string, account: string, event: 'host_offline' | 'device_registered', payload: Record<string, unknown>): Promise<{ ok: boolean; status?: number; error?: string }> {
+    const text = `[DSH Remote] ${event === 'host_offline' ? '主机离线告警' : '新设备接入'} (${account}) ${payload.deviceId ? `设备: ${payload.deviceId}` : ''}`.trim()
+    const plat = (url.includes('open.feishu.cn') || url.includes('open.larksuite.com')) ? 'feishu'
+      : url.includes('oapi.dingtalk.com') ? 'dingtalk'
+      : url.includes('qyapi.weixin.qq.com') ? 'wecom'
+      : url.includes('discord.com/api/webhooks') ? 'discord'
+      : 'custom'
+    let bodyObj: unknown = { event, account, timestamp: Date.now(), msg: text, ...payload }
+    if (plat === 'feishu') bodyObj = { msg_type: 'text', content: { text } }
+    else if (plat === 'dingtalk' || plat === 'wecom') bodyObj = { msgtype: 'text', text: { content: text } }
+    else if (plat === 'discord') bodyObj = { content: text }
+    try {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyObj), signal: AbortSignal.timeout(8000) })
+      return res.ok ? { ok: true, status: res.status } : { ok: false, status: res.status, error: `HTTP ${res.status}` }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  }
+  private async sendWebhook(account: string, event: 'host_offline' | 'device_registered', payload: Record<string, unknown>): Promise<void> {
+    const list = await this.getWebhooks(account)
+    for (const cfg of list) {
+      if (!cfg.enabled || !cfg.url || !cfg.events.includes(event)) continue
+      if (cfg.deviceIds?.length && typeof payload.deviceId === 'string' && !cfg.deviceIds.includes(payload.deviceId)) continue
+      await this.sendOneWebhook(cfg.url, account, event, payload)
+    }
+  }
+  private async cleanupExpired(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastCleanupAt < 300_000) return
+    this.lastCleanupAt = now
+    for (const prefix of ['qr:', 'ostate:', 'hostcode:']) {
+      const entries = await this.ctx.storage.list<{ exp?: number; expiresAt?: number }>({ prefix })
+      const del: string[] = []
+      for (const [k, v] of entries) {
+        const exp = v.exp ?? v.expiresAt ?? 0
+        if (exp > 0 && exp <= now) del.push(k)
+      }
+      if (del.length) await this.ctx.storage.delete(del)
+    }
+    await this.store.cleanupExpiredSessions()
+  }
+  private isEnvAdmin(a: string): boolean {
     return String(this.env.ADMIN_ACCOUNTS ?? '').split(',').map(normEmail).filter(Boolean).includes(normEmail(a))
+  }
+  private isAdminAccount(a: string): boolean {
+    const e = normEmail(a)
+    return this.isEnvAdmin(e) || this.admins.has(e)
+  }
+  private async accountAuth(req: Request): Promise<string> {
+    return this.store.session(this.bearer(req))
   }
   private async adminAuth(req: Request): Promise<string> {
     const tok = this.bearer(req)
@@ -363,16 +693,92 @@ export class Hub extends DurableObject<Env> {
         const devices = await this.store.listAll()
         const items = await Promise.all((await this.store.listAccounts()).map(async email => {
           const mine = devices.filter(d => d.account === email && !d.revoked)
-          return { email, devices: mine.length, online: mine.filter(d => this.peer(d.descriptor.deviceId)).length, admin: this.isAdminAccount(email) }
+          return { email, devices: mine.length, online: mine.filter(d => this.peer(d.descriptor.deviceId)).length, admin: this.isAdminAccount(email), rootAdmin: this.isEnvAdmin(email) }
         }))
         return json(200, { items })
       }
       if (method === 'POST') {
         const { email, password } = loginSchema.parse(await this.body(req))
-        await this.store.upsertAccount(email, password)
-        await this.log('account.upsert', normEmail(email), actor)
-        return json(200, { status: 'ok', account: normEmail(email) })
+        const e = normEmail(email)
+        await this.store.upsertAccount(e, password)
+        await this.ctx.storage.delete(`oauthpw:${e}`)
+        await this.log('account.upsert', e, actor)
+        if (e === normEmail(actor)) {
+          const s = await this.store.createSession(e)
+          return json(200, { status: 'ok', account: e }, { 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) })
+        }
+        return json(200, { status: 'ok', account: e })
       }
+    }
+    const admRole = /^\/accounts\/([^/]+)\/admin$/.exec(p)
+    if (method === 'POST' && admRole) {
+      const e = normEmail(decodeURIComponent(admRole[1]!))
+      const { admin } = z.object({ admin: z.boolean() }).parse(await this.body(req))
+      if (this.isEnvAdmin(e) && !admin) throw new ApiError('INVALID_MESSAGE', 400)
+      if (admin) this.admins.add(e)
+      else this.admins.delete(e)
+      await this.ctx.storage.put('admins', [...this.admins])
+      await this.log('account.admin', `${e} -> ${admin}`, actor)
+      return json(200, { status: 'ok', admin: this.isAdminAccount(e) })
+    }
+    const acctMeta = /^\/accounts\/([^/]+)\/meta$/.exec(p)
+    if (method === 'POST' && acctMeta) {
+      const e = normEmail(decodeURIComponent(acctMeta[1]!))
+      const b = z.object({ disabled: z.boolean().optional(), maxDevices: z.number().int().min(0).max(4096).nullable().optional() }).parse(await this.body(req))
+      await this.store.setAccountMeta(e, b)
+      if (b.disabled) for (const d of await this.store.list(e, true)) await this.disconnect(d.descriptor.deviceId, 'AUTH_INVALID')
+      await this.log('account.meta', `${e} ${JSON.stringify(b)}`, actor)
+      return json(200, { status: 'ok' })
+    }
+    if (p === '/invites') {
+      if (method === 'GET') {
+        const all = await this.ctx.storage.list<{ code: string; maxUses: number; uses: number; expiresAt: number; note?: string; createdAt: number }>({ prefix: 'invite:' })
+        return json(200, { items: [...all.values()].sort((a, b) => b.createdAt - a.createdAt) })
+      }
+      if (method === 'POST') {
+        const b = z.object({
+          code: z.string().trim().min(4).max(32).optional(),
+          count: z.number().int().min(1).max(100).optional(),
+          maxUses: z.number().int().min(1).max(1000).optional(),
+          expiresHours: z.number().int().min(1).max(8760).optional(),
+          note: z.string().trim().max(120).optional(),
+        }).parse(await this.body(req))
+        const count = b.code ? 1 : (b.count ?? 1)
+        const created: Array<{ code: string; maxUses: number; uses: number; expiresAt: number; note: string; createdAt: number }> = []
+        for (let i = 0; i < count; i++) {
+          const code = (b.code || secret().slice(0, 10)).toUpperCase().replace(/[^A-Z0-9_-]/g, '')
+          if (code.length < 4) throw new ApiError('INVALID_MESSAGE')
+          const rec = { code, maxUses: b.maxUses ?? 1, uses: 0, expiresAt: b.expiresHours ? Date.now() + b.expiresHours * 3600_000 : 0, note: b.note ?? '', createdAt: Date.now() }
+          await this.ctx.storage.put(`invite:${code}`, rec)
+          created.push(rec)
+        }
+        await this.log('invite.create', count > 1 ? `batch:${count}` : created[0]!.code, actor)
+        return json(200, { ...created[0], items: created, count: created.length })
+      }
+    }
+    if (method === 'POST' && p === '/invites/batch-delete') {
+      const b = z.object({ codes: z.array(z.string()).max(200).optional(), expired: z.boolean().optional() }).parse(await this.body(req))
+      let removed = 0
+      if (b.expired) {
+        const now = Date.now()
+        const all = await this.ctx.storage.list<{ code: string; maxUses: number; uses: number; expiresAt: number }>({ prefix: 'invite:' })
+        const keys = [...all].filter(([, v]) => (v.expiresAt > 0 && v.expiresAt <= now) || v.uses >= v.maxUses).map(([k]) => k)
+        if (keys.length) { await this.ctx.storage.delete(keys); removed += keys.length }
+      }
+      if (b.codes?.length) {
+        const keys = b.codes.map(c => `invite:${c.toUpperCase()}`)
+        await this.ctx.storage.delete(keys)
+        removed += keys.length
+      }
+      await this.log('invite.batch_delete', `${removed}`, actor)
+      return json(200, { status: 'deleted', removed })
+    }
+    const invDel = /^\/invites\/([A-Za-z0-9_-]{4,32})$/.exec(p)
+    if (method === 'DELETE' && invDel) {
+      const code = invDel[1]!.toUpperCase()
+      await this.ctx.storage.delete(`invite:${code}`)
+      await this.log('invite.delete', code, actor)
+      return json(200, { status: 'deleted' })
     }
     const del = /^\/accounts\/([^/]+)$/.exec(p)
     if (method === 'DELETE' && del) {
@@ -396,6 +802,59 @@ export class Hub extends DurableObject<Env> {
       else await this.disconnect(id, 'CONNECTION_FAILED')
       await this.log(`device.${dev[2]}`, id, actor)
       return json(200, { status: 'ok' })
+    }
+    if (p === '/oauth') {
+      if (method === 'GET') {
+        const ov = await this.oauthOverrides()
+        return json(200, { items: loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).map(x => ({ id: x.id, displayName: x.displayName, enabled: ov[x.id]?.enabled ?? x.enabled, allowRegister: ov[x.id]?.allowRegister ?? x.allowRegister, requireInviteCode: (ov[x.id] as { requireInviteCode?: boolean } | undefined)?.requireInviteCode ?? true, callbackUrl: `${url.origin}/api/v1/auth/oauth/${x.id}/callback`, clientId: x.clientId, source: this.oauthCustom[x.id] ? 'dashboard' : 'env' })) })
+      }
+      if (method === 'POST') {
+        const b = z.object({
+          id: z.string().trim().regex(/^[a-z0-9_-]{1,32}$/),
+          displayName: z.string().trim().min(1).max(32).optional(),
+          clientId: z.string().trim().min(4).max(256),
+          clientSecret: z.string().trim().max(512).optional(),
+          scopes: z.string().trim().max(256).optional(),
+          authUrl: z.string().url().optional(),
+          tokenUrl: z.string().url().optional(),
+          userInfoUrl: z.string().url().optional(),
+          enabled: z.boolean().optional(),
+          allowRegister: z.boolean().optional(),
+        }).parse(await this.body(req))
+        const prev = loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).find(x => x.id === b.id)
+        const sec = b.clientSecret || this.oauthCustom[b.id]?.clientSecret || prev?.clientSecret
+        if (!sec || sec.length < 4) throw new ApiError('INVALID_MESSAGE')
+        this.oauthCustom[b.id] = {
+          enabled: b.enabled ?? prev?.enabled ?? true, allowRegister: b.allowRegister ?? prev?.allowRegister ?? true,
+          ...(b.displayName ? { displayName: b.displayName } : {}),
+          clientId: b.clientId, clientSecret: sec,
+          ...(b.scopes ? { scopes: b.scopes } : {}),
+          ...(b.authUrl ? { authUrl: b.authUrl } : {}),
+          ...(b.tokenUrl ? { tokenUrl: b.tokenUrl } : {}),
+          ...(b.userInfoUrl ? { userInfoUrl: b.userInfoUrl } : {}),
+        }
+        await this.ctx.storage.put('oauth_custom', this.oauthCustom)
+        await this.log('oauth.upsert', b.id, actor)
+        return json(200, { status: 'ok', id: b.id })
+      }
+    }
+    const oaAdm = /^\/oauth\/([a-z0-9_-]+)$/.exec(p)
+    if (oaAdm) {
+      if (method === 'DELETE') {
+        delete this.oauthCustom[oaAdm[1]!]
+        await this.ctx.storage.put('oauth_custom', this.oauthCustom)
+        await this.log('oauth.delete', oaAdm[1]!, actor)
+        return json(200, { status: 'deleted' })
+      }
+      if (method === 'POST') {
+        const b = z.object({ enabled: z.boolean().optional(), allowRegister: z.boolean().optional(), requireInviteCode: z.boolean().optional() }).parse(await this.body(req))
+        const ov = await this.oauthOverrides()
+        ov[oaAdm[1]!] = { ...ov[oaAdm[1]!], ...b }
+        this.oauthOverridesCache = ov
+        await this.ctx.storage.put('oauth', ov)
+        await this.log('oauth.update', `${oaAdm[1]} ${JSON.stringify(b)}`, actor)
+        return json(200, { status: 'ok' })
+      }
     }
     if (method === 'GET' && p === '/links') {
       const now = Date.now()
@@ -537,6 +996,7 @@ export class Hub extends DurableObject<Env> {
     if (this.sockets().some(s => s.ws !== ws && s.att.id === att.id)) return // replaced
     this.peerCache?.delete(att.id)
     for (const link of Object.values(this.links)) if (link.host === att.id || link.client === att.id) this.drop(link, 'CONNECTION_FAILED')
+    if (att.role === 'host' && att.account) this.ctx.waitUntil(this.sendWebhook(att.account, 'host_offline', { deviceId: att.id }))
   }
   async webSocketError(ws: WebSocket): Promise<void> { await this.webSocketClose(ws, 1011) }
 
@@ -558,6 +1018,7 @@ export class Hub extends DurableObject<Env> {
     }
     for (const link of Object.values(this.links)) if (link.stage !== 'ready' && now - link.created > 30_000) this.drop(link, 'CONNECTION_FAILED')
     for (const [k, v] of this.dropped) if (v.expiresAt <= now) this.dropped.delete(k)
+    await this.cleanupExpired()
     if (this.ctx.getWebSockets().length > 0) await this.ctx.storage.setAlarm(now + (waitingHello ? this.cfg.helloTimeoutMs : this.cfg.heartbeatMs))
   }
 

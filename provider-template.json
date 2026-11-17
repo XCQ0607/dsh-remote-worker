@@ -1,0 +1,21 @@
+{
+  "_说明": "复制本文件为 provider.json 后填写，再运行 node scripts/deploy.mjs。以 _ 开头的字段为注释。完整教程见 md/oauth.md。provider.json 含密钥，已加入 .gitignore。",
+  "providers": {
+    "github": {
+      "enabled": true,
+      "allowRegister": true,
+      "displayName": "GitHub",
+      "clientId": "",
+      "clientSecret": "",
+      "_回调地址": "https://<你的域名>/api/v1/auth/oauth/github/callback"
+    },
+    "google": {
+      "enabled": true,
+      "allowRegister": true,
+      "displayName": "Google",
+      "clientId": "",
+      "clientSecret": "",
+      "_回调地址": "https://<你的域名>/api/v1/auth/oauth/google/callback"
+    }
+  }
+}

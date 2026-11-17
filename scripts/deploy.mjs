@@ -110,6 +110,11 @@ let turn = existing.has('TURN_KEY_ID') ? 'kept' : 'none'
     }
     if (turn === 'none') console.log('  TURN not configured (Relay-only). Create it later in the dashboard: TURN 中转 -> 一键创建.')
   }
+  const providerFile = join(base, 'provider.json')
+  if (existsSync(providerFile)) {
+    try { secrets.OAUTH_PROVIDERS = JSON.stringify(JSON.parse(readFileSync(providerFile, 'utf8'))); console.log('  OAuth providers loaded from provider.json') }
+    catch (e) { console.log('  provider.json invalid, skipped:', e.message) }
+  }
   if (Object.keys(secrets).length) {
     const tmp = join(worker, '.secrets.tmp.json')
     writeFileSync(tmp, JSON.stringify(secrets))
