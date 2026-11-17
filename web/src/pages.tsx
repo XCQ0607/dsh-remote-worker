@@ -37,7 +37,7 @@ export function Overview() {
       <Stat icon={<Plug size={15} />} label="在线设备" value={d.devices.online} />
       <Stat icon={<Cloud size={15} />} label="活动连接" value={d.links} unit={`${d.sockets} WS`} />
     </div>
-    <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(320px,1fr))' }}>
+    <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(min(100%,280px),1fr))' }}>
       <div className="card"><h3>TURN 中转</h3>
         <div className="row"><Badge ok={d.turn.enabled}>{d.turn.enabled ? '已启用' : d.turn.configured ? '已配置但被关闭' : '未配置(仅 Relay)'}</Badge>
           <button className="btn sm right" onClick={testTurn}><CheckCircle2 size={14} />测试签发</button></div>
@@ -125,7 +125,7 @@ export function Accounts() {
       <div className="form2"><div className="field"><label>邮箱</label><input value={email} onChange={e => setEmail(e.target.value)} /></div>
         <div className="field"><label>密码(≥12 位)</label><input type="password" value={password} onChange={e => setPassword(e.target.value)} /></div></div>
       <button className="btn pri" disabled={!email || password.length < 12} onClick={save}><Save size={15} />保存</button></div>
-    <div className="card"><table><thead><tr><th>账号</th><th>设备</th><th>在线</th><th /></tr></thead><tbody>
+    <div className="card" style={{ overflowX: 'auto' }}><table><thead><tr><th>账号</th><th>设备</th><th>在线</th><th /></tr></thead><tbody>
       {d?.items?.map((a: any) => <tr key={a.email}><td>{a.email} {a.admin && <span className="badge warn"><i />管理员</span>}</td><td>{a.devices}</td><td>{a.online}</td>
         <td style={{ textAlign: 'right' }}><button className="btn sm danger" onClick={() => del(a.email)}><Trash2 size={13} />删除</button></td></tr>)}
     </tbody></table></div>
@@ -158,7 +158,7 @@ export function Events() {
       <button className="btn" onClick={reload}><RefreshCw size={15} />刷新</button>
       <button className="btn danger" onClick={clear}><Trash2 size={15} />清空</button>
     </Head>
-    <div className="card"><table><thead><tr><th>时间</th><th>事件</th><th>详情</th><th>操作者</th></tr></thead><tbody>
+    <div className="card" style={{ overflowX: 'auto' }}><table><thead><tr><th>时间</th><th>事件</th><th>详情</th><th>操作者</th></tr></thead><tbody>
       {items.map((e: any, i: number) => <tr key={i}><td className="mono">{new Date(e.t).toLocaleString()}</td><td>{e.type}</td><td className="mono">{e.detail}</td><td className="mono">{e.actor}</td></tr>)}
     </tbody></table>{d && !items.length && <div className="empty">暂无记录</div>}</div>
   </>)
@@ -175,7 +175,7 @@ export function Turn() {
   const run = async (fn: () => Promise<any>, ok: string) => { try { await fn(); toast('s', ok); reload() } catch (e: any) { toast('e', e.message || e.code) } }
   return (<>
     <Head title="TURN 中转" sub="使用 Cloudflare Realtime TURN(每月 1,000GB 免费),让 P2P 失败时仍可低延迟中转" />
-    <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(320px,1fr))' }}>
+    <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(min(100%,280px),1fr))' }}>
       <div className="card"><h3>当前状态</h3>
         <div className="row"><Badge ok={!!d?.configured}>{d?.configured ? `已配置(${d.source === 'env' ? '环境变量' : '后台'})` : '未配置'}</Badge></div>
         <p className="hint">Key ID:{d?.keyId ?? '-'}</p>

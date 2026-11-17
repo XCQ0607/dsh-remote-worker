@@ -62,17 +62,27 @@ export function App() {
     body = (
       <div className="app">
         <aside className="side">
-          <div className="brand"><img src="/favicon.svg" alt="DSH Remote" style={{ width: 28, height: 28 }} />DSH Remote</div>
-          {me.isAdmin ? ADMIN_TABS.map(([id, label, Icon]) => (
-            <button key={id} className={`nav ${tab === id ? 'on' : ''}`} onClick={() => setTab(id)}><Icon size={18} /><span>{label}</span></button>
-          )) : <button className="nav on"><Activity size={18} /><span>我的设备</span></button>}
-          <div className="grow" />
-          <div className="mono" style={{ padding: '0 12px' }}><KeyRound size={12} /> {me.account}</div>
-          <button className="nav" onClick={() => setDark(d => !d)}>{dark ? <Sun size={18} /> : <Moon size={18} />}<span>{dark ? '浅色模式' : '深色模式'}</span></button>
-          <button className="nav" onClick={async () => { await api('/api/v1/auth/logout', { method: 'POST', body: {} }); setMe(null) }}><LogOut size={18} /><span>退出登录</span></button>
-          <div className="hint" style={{ padding: '6px 12px 0' }}><CopyRight /></div>
+          <div className="side-head">
+            <div className="brand"><img src="/favicon.svg" alt="DSH Remote" style={{ width: 28, height: 28 }} />DSH Remote</div>
+            <div className="side-actions">
+              <button className="nav icon-only" title={dark ? '浅色模式' : '深色模式'} onClick={() => setDark(d => !d)}>{dark ? <Sun size={18} /> : <Moon size={18} />}</button>
+              <button className="nav icon-only" title="退出登录" onClick={async () => { await api('/api/v1/auth/logout', { method: 'POST', body: {} }); setMe(null) }}><LogOut size={18} /></button>
+            </div>
+          </div>
+          <nav className="side-nav">
+            {me.isAdmin ? ADMIN_TABS.map(([id, label, Icon]) => (
+              <button key={id} className={`nav ${tab === id ? 'on' : ''}`} onClick={() => setTab(id)}><Icon size={18} /><span>{label}</span></button>
+            )) : <button className="nav on"><Activity size={18} /><span>我的设备</span></button>}
+          </nav>
+          <div className="grow side-foot-spacer" />
+          <div className="side-foot">
+            <div className="mono" style={{ padding: '0 12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><KeyRound size={12} /> {me.account}</div>
+            <button className="nav" onClick={() => setDark(d => !d)}>{dark ? <Sun size={18} /> : <Moon size={18} />}<span>{dark ? '浅色模式' : '深色模式'}</span></button>
+            <button className="nav" onClick={async () => { await api('/api/v1/auth/logout', { method: 'POST', body: {} }); setMe(null) }}><LogOut size={18} /><span>退出登录</span></button>
+            <div className="hint" style={{ padding: '6px 12px 0' }}><CopyRight /></div>
+          </div>
         </aside>
-        <main className="main"><Page /></main>
+        <main className="main"><Page /><footer className="mob-foot hint"><CopyRight /></footer></main>
       </div>
     )
   }
