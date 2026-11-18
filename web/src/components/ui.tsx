@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { ChevronDown, Globe } from 'lucide-react'
 
 export function ProviderIcon({ id, size = 16 }: { id: string; size?: number }) {
@@ -61,9 +62,10 @@ export function Modal({ title, children, onClose }: { title: string; children: R
     const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     addEventListener('keydown', h); return () => removeEventListener('keydown', h)
   }, [onClose])
-  return (
+  return createPortal(
     <div className="modal-mask" onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal card"><h3>{title}</h3>{children}</div>
-    </div>
+    </div>,
+    document.body,
   )
 }

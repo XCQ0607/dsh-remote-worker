@@ -8,7 +8,7 @@ import './turn.css'
 
 const Pw = ({ v, on, ph }: { v: string; on: (v: string) => void; ph?: string }) => {
   const [show, setShow] = useState(false)
-  return <div className="tn-pw"><input type={show ? 'text' : 'password'} value={v} placeholder={ph} autoComplete="off" onChange={e => on(e.target.value)} />
+  return <div className="tn-pw"><input type="text" className={show ? '' : 'secret-mask'} value={v} placeholder={ph} autoComplete="off" data-lpignore="true" data-1p-ignore="true" spellCheck={false} autoCapitalize="none" onChange={e => on(e.target.value)} />
     <button type="button" className="icon-btn" onClick={() => setShow(!show)}>{show ? <EyeOff size={14} /> : <Eye size={14} />}</button></div>
 }
 
@@ -39,7 +39,7 @@ export function Turn() {
           {test && <div className={`tn-res ${test.turn ? 'ok' : 'bad'}`}>{test.turn ? `成功:返回 ${test.servers?.length ?? 0} 组服务器` : `失败:${test.error ?? '未配置 TURN'}`}</div>}
         </div>
         <div className="card"><h3>手动填入已有 Key</h3>
-          <div className="field"><label>TURN Key ID</label><input value={f.keyId} onChange={e => set('keyId')(e.target.value)} /></div>
+          <div className="field"><label>TURN Key ID</label><input autoComplete="off" data-lpignore="true" spellCheck={false} value={f.keyId} onChange={e => set('keyId')(e.target.value)} /></div>
           <div className="field"><label>TURN API Token</label><Pw v={f.turnToken} on={set('turnToken')} /></div>
           <button className="btn" disabled={!f.keyId || !f.turnToken || busy === 'man'} onClick={() => run('man', () => api('/api/v1/admin/turn/manual', { body: { keyId: f.keyId, apiToken: f.turnToken } }), '已保存')}><Save size={15} />保存</button></div>
       </div>
@@ -47,7 +47,7 @@ export function Turn() {
         <p className="hint">凭据只用于本次调用 Cloudflare API,不会被保存。需要 Realtime/Calls 编辑权限。</p>
         <div className="tn-tabs"><button className={mode === 'token' ? 'on' : ''} onClick={() => setMode('token')}>API Token</button><button className={mode === 'global' ? 'on' : ''} onClick={() => setMode('global')}>Global API Key</button></div>
         <div className="tn-form">
-          <div className="field"><label>Account ID</label><input value={f.accountId} onChange={e => set('accountId')(e.target.value)} placeholder="32 位十六进制" />{f.accountId && !accOk && <p className="hint tn-err">需为 32 位十六进制</p>}</div>
+          <div className="field"><label>Account ID</label><input autoComplete="off" data-lpignore="true" spellCheck={false} value={f.accountId} onChange={e => set('accountId')(e.target.value)} placeholder="32 位十六进制" />{f.accountId && !accOk && <p className="hint tn-err">需为 32 位十六进制</p>}</div>
           {mode === 'token' ? <div className="field"><label>API Token</label><Pw v={f.apiToken} on={set('apiToken')} /></div> : <>
             <div className="field"><label>邮箱</label><input type="email" value={f.email} onChange={e => set('email')(e.target.value)} /></div>
             <div className="field"><label>Global API Key</label><Pw v={f.apiKey} on={set('apiKey')} /></div></>}

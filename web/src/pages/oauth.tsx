@@ -77,8 +77,8 @@ export function OAuth() {
         <div className="field"><label>平台预设</label><Select value={f.preset} options={OAUTH_PRESETS} disabled={f.editing} onChange={onPreset} /></div>
         <div className="field"><label>标识 ID（小写字母/数字）</label><input value={f.id} disabled={f.preset !== 'custom' || f.editing} onChange={e => setF({ ...f, id: e.target.value })} placeholder="如 linuxdo" /></div>
         <div className="field"><label>显示名称</label><input value={f.displayName} onChange={e => setF({ ...f, displayName: e.target.value })} placeholder="如 GitHub" /></div>
-        <div className="field"><label>Client ID</label><input value={f.clientId} onChange={e => setF({ ...f, clientId: e.target.value })} /></div>
-        <div className="field"><label>{f.editing ? 'Client Secret（留空则保留原密钥）' : 'Client Secret'}</label><input type="password" value={f.clientSecret} onChange={e => setF({ ...f, clientSecret: e.target.value })} /></div>
+        <div className="field"><label>Client ID</label><input autoComplete="off" data-lpignore="true" data-1p-ignore="true" spellCheck={false} value={f.clientId} onChange={e => setF({ ...f, clientId: e.target.value })} /></div>
+        <div className="field"><label>{f.editing ? 'Client Secret（留空则保留原密钥）' : 'Client Secret'}</label><input type="text" className="secret-mask" autoComplete="off" data-lpignore="true" data-1p-ignore="true" spellCheck={false} autoCapitalize="none" value={f.clientSecret} onChange={e => setF({ ...f, clientSecret: e.target.value })} /></div>
         {f.preset === 'custom' && <>
           <div className="field"><label>Auth URL</label><input value={f.authUrl} onChange={e => setF({ ...f, authUrl: e.target.value })} placeholder="https://..." /></div>
           <div className="field"><label>Token URL</label><input value={f.tokenUrl} onChange={e => setF({ ...f, tokenUrl: e.target.value })} placeholder="https://..." /></div>

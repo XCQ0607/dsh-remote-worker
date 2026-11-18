@@ -28,7 +28,11 @@
   .iv-stats{display:flex;flex-wrap:nowrap;gap:8px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
   .iv-stats::-webkit-scrollbar{display:none}
   .iv-stat{flex:1 0 84px;padding:8px 10px}.iv-stat b{font-size:17px}
-  .iv-bar{gap:6px}.iv-bar .btn.sm{padding:5px 9px;font-size:12px}
+  .iv-bar{gap:6px;margin-bottom:8px}.iv-bar .btn.sm{padding:5px 9px;font-size:12px}
   .iv-search{flex:1 0 100%}
-  .iv-item{padding:10px}.iv-item .r{margin-left:auto}.iv-item .r:has(.btn){width:100%}.iv-item .r .btn{flex:1}
+  .iv-list{gap:6px}
+  .iv-item{padding:8px 10px}
+  .iv-item .row-top{gap:8px}
+  .iv-item .main{flex:1 1 150px}
+  .iv-item .r{margin-left:auto}.iv-item .r:has(.btn){width:100%}.iv-item .r .btn{flex:1;padding:5px 8px;font-size:12px}
 }

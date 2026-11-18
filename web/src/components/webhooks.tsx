@@ -119,7 +119,7 @@ export function WebhookPanel() {
       <form className="wh-modal-form" onSubmit={save}>
         <div className="field"><label>名称（可选）</label><input value={f.name} maxLength={64} onChange={e => setF({ ...f, name: e.target.value })} placeholder="例如 运维告警群" /></div>
         <div className="field"><label>Webhook URL（仅支持 https）</label><input type="url" required={!f.id} value={f.url} onChange={e => setF({ ...f, url: e.target.value })} placeholder={f.id ? '留空保持原地址不变' : 'https://...'} /></div>
-        <div className="field"><label>签名密钥{f.hasSecret ? '（已设置，留空不修改）' : ''}</label><input type="password" autoComplete="new-password" disabled={f.clearSecret} value={f.secret} onChange={e => setF({ ...f, secret: e.target.value })} placeholder={PLAT[plat].hint} />
+        <div className="field"><label>签名密钥{f.hasSecret ? '（已设置，留空不修改）' : ''}</label><input type="text" className="secret-mask" autoComplete="off" data-lpignore="true" data-1p-ignore="true" spellCheck={false} autoCapitalize="none" disabled={f.clearSecret} value={f.secret} onChange={e => setF({ ...f, secret: e.target.value })} placeholder={PLAT[plat].hint} />
           {f.hasSecret && <label style={{ marginTop: 6, fontSize: 12 }}><input type="checkbox" checked={!!f.clearSecret} onChange={e => setF({ ...f, clearSecret: e.target.checked, secret: '' })} /><span>清除已设置的密钥</span></label>}</div>
         <div className="field"><label>仅监控设备 ID（逗号分隔，留空监控全部）</label><input value={f.devs} onChange={e => setF({ ...f, devs: e.target.value })} placeholder="device-1, device-2" /></div>
         <div className="field"><label>离线防抖延迟（秒，0=立即，建议 15-60 避免重连误报）</label><input type="number" min={0} max={300} value={f.delay} onChange={e => setF({ ...f, delay: e.target.value })} /></div>

@@ -26,19 +26,26 @@
 .pg-live i{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:pgp 2s infinite}@keyframes pgp{50%{opacity:.3}}
 .pg-more{display:flex;justify-content:center;margin-top:12px}
 @media(max-width:600px){
-  .pg-head{align-items:center}
+  .pg-head{align-items:center;margin-bottom:10px}
   .pg-head h1{font-size:19px}
   .pg-acts{gap:6px;width:100%}.pg-acts .btn{padding:6px 10px;font-size:12.5px}.pg-live{margin-right:auto}
-  .pg-stats{grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px}
-  .pg-stat{padding:8px 10px;gap:8px}
-  .pg-stat .ic{width:28px;height:28px;border-radius:8px}
+  .pg-stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:10px}
+  .pg-stats:has(> :nth-child(3):last-child){grid-template-columns:repeat(3,minmax(0,1fr))}
+  .pg-stat{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:2px 8px;padding:8px 10px}
+  .pg-stat>div:last-child{display:contents}
+  .pg-stat .ic{width:24px;height:24px;border-radius:7px}
   .pg-stat b{font-size:17px}
-  .pg-bar{gap:6px}
+  .pg-stat span{grid-column:1 / -1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11.5px}
+  .pg-bar{gap:6px;margin-bottom:8px}
   .pg-bar .search-box{flex:1 0 100%}
-  .pg-bar .seg,.seg{display:flex;flex-wrap:nowrap;gap:6px;overflow-x:auto;max-width:100%;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding-bottom:2px}
+  .pg-bar .seg,.seg{display:flex;flex-wrap:nowrap!important;gap:6px;overflow-x:auto;max-width:100%;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding-bottom:2px}
   .pg-bar .seg::-webkit-scrollbar,.seg::-webkit-scrollbar{display:none}
   .seg .chip{flex:0 0 auto;white-space:nowrap}
   .pg-bar select{flex:1 1 130px;min-width:0}
+  .pg-list{gap:6px}
+  .pg-item{padding:8px 10px;gap:6px 10px}
+  .pg-item .m{display:block;line-height:1.45}
+  .pg-item .m>*+*{margin-left:10px}
   .pg-item>.pg-ev{flex:1 0 100%;font-size:11.5px}
-  .pg-item .acts{width:100%}.pg-item .acts .btn{flex:1}
+  .pg-item .acts{width:100%}.pg-item .acts .btn{flex:1;padding:5px 8px;font-size:12px}
 }.spin{animation:pgsp .6s linear}@keyframes pgsp{to{transform:rotate(360deg)}}
