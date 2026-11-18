@@ -6,3 +6,4 @@ env.json
 /sources
 /dev
 provider.json
+worker/public/
