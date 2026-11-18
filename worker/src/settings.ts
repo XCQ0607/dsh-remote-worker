@@ -36,6 +36,8 @@ export interface Settings {
   oauthBlockedDomains: string[]
   /** 是否要求新用户注册时提供邀请码（仅管理员可生成）。 */
   requireInviteCode: boolean
+  /** 启用 DSH Go 扫码设备配对（dsh-pairing-v1）。 */
+  devicePairingEnabled: boolean
 }
 
 type EnvLike = Record<string, unknown>
@@ -137,12 +139,13 @@ export function defaultSettings(env: EnvLike): Settings {
     stunServers: mergeStunFromUrls(customStun, includePublic),
     siteName: env.DSH_SITE_NAME ?? 'DSH Remote',
     originRules,
+    devicePairingEnabled: env.DSH_DEVICE_PAIRING_ENABLED !== 'false',
   }, {
     heartbeatMs: 25_000, helloTimeoutMs: 5000, heartbeatDisconnectMs: 75_000, maxFramesPerSec: 512, maxConnections: 256,
     maxDevicesPerAccount: 256, sessionHours: 8, p2pEnabled: true, stunEnabled: true, maxEnabledStun: DEFAULT_MAX_ENABLED_STUN,
     turnEnabled: true, turnTtlSeconds: 300,
     stunServers: defaultStunServers(), siteName: 'DSH Remote', originRules: [], allowedOrigins: [],
-    oauthAllowedDomains: [], oauthBlockedDomains: [], requireInviteCode: false,
+    oauthAllowedDomains: [], oauthBlockedDomains: [], requireInviteCode: false, devicePairingEnabled: true,
   })
 }
 
@@ -185,5 +188,6 @@ export function sanitize(input: Record<string, unknown>, base: Settings): Settin
     ? [...new Set(strList(input.oauthBlockedDomains).map(d => d.toLowerCase().replace(/^@/, '')).filter(Boolean))].slice(0, 64)
     : base.oauthBlockedDomains
   s.requireInviteCode = boolFlag(input.requireInviteCode, base.requireInviteCode)
+  s.devicePairingEnabled = boolFlag(input.devicePairingEnabled, base.devicePairingEnabled)
   return s
 }

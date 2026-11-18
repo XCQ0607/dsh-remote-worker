@@ -1,19 +1,30 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Activity, KeyRound, LayoutDashboard, Link2, LogOut, Moon, Radio, ScrollText, Server, Settings, Sun, Ticket, User, Users, Wifi } from 'lucide-react'
-import { api } from './api'
-import { ToastCtx } from './toast'
-import { ProviderIcon } from './ui'
-import { Accounts, AllDevices, Events, InvitesPage, Links, MyDevices, NetworkPage, OAuth, Overview, ProfilePage, SettingsPage, Turn } from './pages'
+import { api, CODE_MSG } from './lib/api'
+import { ToastCtx } from './lib/toast'
+import { ProviderIcon } from './components/ui'
+import { Accounts } from './pages/accounts'
+import { AllDevices, MyDevices } from './pages/devices'
+import { Events } from './pages/events'
+import { InvitesPage } from './pages/invites'
+import { Links } from './pages/links'
+import { NetworkPage } from './pages/network'
+import { OAuth } from './pages/oauth'
+import { Overview } from './pages/overview'
+import { ProfilePage } from './pages/profile'
+import { SettingsPage } from './pages/settings'
+import { Turn } from './pages/turn'
 
 type Toast = { id: number; kind: 's' | 'e'; text: string }
-type Me = { account: string; isAdmin: boolean }
+type Me = { account: string; isAdmin: boolean; rootAdmin?: boolean; adminPerms?: string[] }
 
 const ADMIN_TABS = [
   ['overview', '概览', LayoutDashboard, Overview], ['devices', '全部设备', Server, AllDevices], ['accounts', '账号管理', Users, Accounts],
   ['links', '实时连接', Link2, Links], ['turn', 'TURN 中转', Radio, Turn], ['settings', '系统设置', Settings, SettingsPage],
   ['oauth', 'OAuth 登录', KeyRound, OAuth], ['invites', '邀请码', Ticket, InvitesPage], ['events', '审计日志', ScrollText, Events],
-  ['profile', '个人中心', User, ProfilePage], ['network', '网络诊断', Wifi, NetworkPage],
+  ['my-devices', '我的设备', Activity, MyDevices], ['profile', '个人中心', User, ProfilePage], ['network', '网络诊断', Wifi, NetworkPage],
 ] as const
+const PUBLIC_TABS = new Set(['my-devices', 'profile', 'network'])
 
 const USER_TABS = [
   ['devices', '我的设备', Activity, MyDevices],
@@ -42,12 +53,12 @@ function Login({ onDone }: { onDone: () => void }) {
     api('/api/v1/auth/oauth/providers').then(r => setOauth(r.items ?? [])).catch(() => { })
     const sp = new URLSearchParams(location.search)
     const e = sp.get('oauth_error')
-    if (e) { setErr(e === 'OAUTH_REGISTER_DISABLED' ? '该登录方式未开放注册，请联系管理员' : `第三方登录失败: ${e}`); history.replaceState(null, '', '/') }
+    if (e) { setErr(CODE_MSG[e] || `第三方登录失败: ${e}`); history.replaceState(null, '', '/') }
     if (sp.get('oauth_invite')) history.replaceState(null, '', '/')
   }, [])
   const go = async () => {
     setBusy(true); setErr('')
-    try { await api('/api/v1/auth/login', { body: { email, password } }); onDone() } catch { setErr('账号或密码错误') } finally { setBusy(false) }
+    try { await api('/api/v1/auth/login', { body: { email, password } }); onDone() } catch (err: any) { setErr(err?.message || '账号或密码错误') } finally { setBusy(false) }
   }
   const submitInvite = async () => {
     setBusy(true); setErr('')
@@ -99,7 +110,14 @@ export function App() {
   const load = useCallback(() => { api<Me>('/api/v1/auth/me').then(setMe).catch(() => setMe(null)) }, [])
   const navRef = useRef<HTMLElement | null>(null)
   useEffect(load, [load])
-  useEffect(() => { location.hash = tab }, [tab])
+  useEffect(() => {
+    if (!me) return
+    const allowed = me.isAdmin
+      ? ADMIN_TABS.filter(([id]) => PUBLIC_TABS.has(id) || me.rootAdmin || !me.adminPerms || me.adminPerms.includes(id))
+      : USER_TABS
+    if (allowed.length && !allowed.some(t => t[0] === tab)) setTab(allowed[0][0])
+    else location.hash = tab
+  }, [me, tab])
   // 手机端导航是横向滚动条，切换后把当前项滚进可视区
   useEffect(() => {
     const box = navRef.current
@@ -112,8 +130,11 @@ export function App() {
   if (me === undefined) body = null
   else if (me === null) body = <Login onDone={load} />
   else {
-    const tabs = me.isAdmin ? ADMIN_TABS : USER_TABS
-    const Page = (tabs.find(t => t[0] === tab)?.[3] ?? tabs[0][3]) as () => ReactNode
+    const tabs = me.isAdmin
+      ? ADMIN_TABS.filter(([id]) => PUBLIC_TABS.has(id) || me.rootAdmin || !me.adminPerms || me.adminPerms.includes(id))
+      : USER_TABS
+    const activeTab = tabs.some(t => t[0] === tab) ? tab : tabs[0][0]
+    const Page = (tabs.find(t => t[0] === activeTab)?.[3] ?? tabs[0][3]) as () => ReactNode
     body = (
       <div className="app">
         <aside className="side">
@@ -125,8 +146,8 @@ export function App() {
             </div>
           </div>
           <nav className="side-nav" ref={navRef}>
-            {(me.isAdmin ? ADMIN_TABS : USER_TABS).map(([id, label, Icon]) => (
-              <button key={id} className={`nav ${tab === id ? 'on' : ''}`} onClick={() => setTab(id)}><Icon size={18} /><span>{label}</span></button>
+            {tabs.map(([id, label, Icon]) => (
+              <button key={id} className={`nav ${activeTab === id ? 'on' : ''}`} onClick={() => setTab(id)}><Icon size={18} /><span>{label}</span></button>
             ))}
           </nav>
           <div className="grow side-foot-spacer" />

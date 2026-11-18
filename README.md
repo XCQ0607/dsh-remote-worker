@@ -19,9 +19,12 @@ Host 插件 / 桌面 / Android / 浏览器管理后台
         ▼
 Worker (worker/src/index.ts)          ← 无状态路由 + 安全响应头 + 静态资源 (ASSETS)
   ├─ /api/v1/* , /ws/v1/connect ───► Hub (Durable Object, SQLite 后端, Hibernation WS)
-  │                                     ├─ 多账号存储与设备注册表 (store.ts)
-  │                                     ├─ Link 状态机与 Relay 帧互转 (hub.ts)
-  │                                     ├─ Cloudflare Realtime TURN 凭据签发 (ice.ts)
+  │                                     ├─ 多账号隔离、配额与设备注册表 (store.ts)
+  │                                     ├─ Link 状态机、RBAC 权限与 Relay 互转 (hub.ts)
+  │                                     ├─ DSH Go 扫码配对会话状态机 (pairing.ts)
+  │                                     ├─ 多平台 Webhook 告警与防抖恢复 (webhook.ts)
+  │                                     ├─ OAuth 登录与扫码授权 (oauth.ts)
+  │                                     ├─ Cloudflare TURN 与 STUN 列表 (ice.ts / stun.ts)
   │                                     └─ 运行时配置覆盖与审计日志 (settings.ts)
   └─ /* (SPA) ─────────────────────► web/ 构建产物 (worker/public)
 ```
@@ -36,19 +39,19 @@ Worker (worker/src/index.ts)          ← 无状态路由 + 安全响应头 + �
 
 ---
 
-## 方式零：下载 Release 发布包部署（无需构建）
+## 推荐方式：下载 Release 发布包部署（无需构建）
 
 每次发布都会在 [Releases](https://github.com/XCQ0607/dsh-remote-worker/releases) 提供两个压缩包和一份校验和：
 
-| 资产                                        | 内容                                                                                                     | 适用场景                                   |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `dsh-remote-worker-vX.Y.Z.zip`            | **预构建可部署包**：`worker/`（含已构建好的 `public/` 前端产物）、`scripts/deploy.mjs`、`env-template.json`、README、LICENSE、changelog | 只想尽快跑起来，不关心前端源码             |
-| `dsh-remote-worker-vX.Y.Z-source.zip`     | **完整源码包**：在上面的基础上追加 `web/` 前端源码与 `.github/` 工作流                                       | 想改前端、自己发版或提交 PR                |
-| `SHA256SUMS.txt`                           | 上面两个 zip 的 SHA-256 校验和                                                                            | 下载后核对完整性                           |
+| 资产                                    | 内容                                                                                                                                                  | 适用场景                       |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| `dsh-remote-worker-vX.Y.Z.zip`        | **预构建可部署包**：`worker/`（含已构建好的 `public/` 前端产物）、`scripts/deploy.mjs`、`env-template.json`、README、LICENSE、changelog | 只想尽快跑起来，不关心前端源码 |
+| `dsh-remote-worker-vX.Y.Z-source.zip` | **完整源码包**：在上面的基础上追加 `web/` 前端源码与 `.github/` 工作流                                                                      | 想改前端、自己发版或提交 PR    |
+| `SHA256SUMS.txt`                      | 上面两个 zip 的 SHA-256 校验和                                                                                                                        | 下载后核对完整性               |
 
 ### 1. 下载并解压
 
-在仓库 **Releases** 页面下载对应 zip，解压后进入目录（下文以 `dsh-remote-worker-v1.0.1` 为例）：
+在仓库 **Releases** 页面下载对应 zip，解压后进入目录（下文以 `dsh-remote-worker-v1.0.2` 为例）：
 
 ```bash
 # 可选：核对校验和
@@ -58,7 +61,7 @@ sha256sum -c SHA256SUMS.txt
 解压后的目录结构：
 
 ```
-dsh-remote-worker-v1.0.1/
+dsh-remote-worker-v1.0.2/
 ├── worker/            # Worker 源码 + 已构建的 public/ 前端（wrangler.jsonc 在此）
 ├── scripts/deploy.mjs # 一键部署脚本
 ├── env-template.json  # 配置模板，复制为 env.json 后填写
@@ -189,26 +192,26 @@ cd ../web && npm ci && npm run build
 
 按需修改 `name`（Worker 名称，默认 `dsh-remote`）以及 `vars` 中的默认环境变量（后续可在管理后台「系统设置」中实时覆盖）：
 
-| 变量                            | 默认值                            | 说明                                                                           |
-| ------------------------------- | --------------------------------- | ------------------------------------------------------------------------------ |
-| `DSH_SITE_NAME`               | `DSH Remote`                    | 站点与后台标题                                                                 |
-| `ADMIN_ACCOUNTS`              | `xcq0607@gmail.com`             | **必改**：允许登录管理后台的管理员邮箱（逗号分隔）                       |
-| `DSH_HEARTBEAT_MS`            | `25000`                         | WebSocket ping 心跳间隔（ms）                                                  |
-| `DSH_HEARTBEAT_DISCONNECT_MS` | `75000`                         | 心跳超时断开阈值（ms）                                                         |
-| `DSH_HELLO_TIMEOUT_MS`        | `5000`                          | 建连后 Hello 握手超时（ms）                                                    |
-| `DSH_MAX_FRAMES_PER_SEC`      | `512`                           | 单连接每秒最大帧数                                                             |
-| `DSH_MAX_CONNECTIONS`         | `256`                           | 最大并发 WebSocket 数                                                          |
-| `DSH_MAX_DEVICES_PER_ACCOUNT` | `256`                           | 每账号最大设备数                                                               |
-| `DSH_SESSION_HOURS`           | `8`                             | Web 登录有效期（小时）                                                         |
-| `DSH_P2P_ENABLED`             | `true`                          | 是否允许设备协商 WebRTC P2P 直连（默认开启）                                   |
-| `DSH_TURN_ENABLED`            | `true`                          | 是否启用 TURN（P2P 失败时的中继兜底）                                          |
-| `DSH_TURN_TTL_SECONDS`        | `300`                           | 短期 TURN 凭据有效期（秒）                                                     |
-| `DSH_STUN_ENABLED`            | `true`                          | STUN 总开关默认值（用于 P2P 打洞；关闭后不下发任何 STUN）                      |
-| `DSH_MAX_ENABLED_STUN`        | `6`                             | 同时启用的 STUN 数量上限（1–16，防止过多超时 STUN 拖慢 ICE 建连）              |
-| `DSH_STUN_URLS`               | `""`                            | 额外自定义 STUN（逗号分隔），会排在默认公共 STUN 列表之前                      |
-| `DSH_STUN_USE_PUBLIC_LIST`    | `true`                          | 初始化时是否附带内置完整公共 STUN 列表                                         |
-| `DSH_ALLOWED_ORIGINS`         | `""`                            | 额外允许的 Origin（逗号分隔，后台支持卡片式增删与禁用）                        |
-| `DSH_DO_LOCATION`             | `""`                            | Durable Object 区域提示（`apac` / `wnam` / `weur` 等，仅对新建 DO 生效） |
+| 变量                            | 默认值                | 说明                                                                           |
+| ------------------------------- | --------------------- | ------------------------------------------------------------------------------ |
+| `DSH_SITE_NAME`               | `DSH Remote`        | 站点与后台标题                                                                 |
+| `ADMIN_ACCOUNTS`              | `xcq0607@gmail.com` | **必改**：允许登录管理后台的管理员邮箱（逗号分隔）                       |
+| `DSH_HEARTBEAT_MS`            | `25000`             | WebSocket ping 心跳间隔（ms）                                                  |
+| `DSH_HEARTBEAT_DISCONNECT_MS` | `75000`             | 心跳超时断开阈值（ms）                                                         |
+| `DSH_HELLO_TIMEOUT_MS`        | `5000`              | 建连后 Hello 握手超时（ms）                                                    |
+| `DSH_MAX_FRAMES_PER_SEC`      | `512`               | 单连接每秒最大帧数                                                             |
+| `DSH_MAX_CONNECTIONS`         | `256`               | 最大并发 WebSocket 数                                                          |
+| `DSH_MAX_DEVICES_PER_ACCOUNT` | `256`               | 每账号最大设备数                                                               |
+| `DSH_SESSION_HOURS`           | `8`                 | Web 登录有效期（小时）                                                         |
+| `DSH_P2P_ENABLED`             | `true`              | 是否允许设备协商 WebRTC P2P 直连（默认开启）                                   |
+| `DSH_TURN_ENABLED`            | `true`              | 是否启用 TURN（P2P 失败时的中继兜底）                                          |
+| `DSH_TURN_TTL_SECONDS`        | `300`               | 短期 TURN 凭据有效期（秒）                                                     |
+| `DSH_STUN_ENABLED`            | `true`              | STUN 总开关默认值（用于 P2P 打洞；关闭后不下发任何 STUN）                      |
+| `DSH_MAX_ENABLED_STUN`        | `6`                 | 同时启用的 STUN 数量上限（1–16，防止过多超时 STUN 拖慢 ICE 建连）             |
+| `DSH_STUN_URLS`               | `""`                | 额外自定义 STUN（逗号分隔），会排在默认公共 STUN 列表之前                      |
+| `DSH_STUN_USE_PUBLIC_LIST`    | `true`              | 初始化时是否附带内置完整公共 STUN 列表                                         |
+| `DSH_ALLOWED_ORIGINS`         | `""`                | 额外允许的 Origin（逗号分隔，后台支持卡片式增删与禁用）                        |
+| `DSH_DO_LOCATION`             | `""`                | Durable Object 区域提示（`apac` / `wnam` / `weur` 等，仅对新建 DO 生效） |
 
 ### 4. 部署 Worker 与写入管理员密钥 (`ADMIN_TOKEN`)
 
@@ -278,7 +281,7 @@ OAUTH_PROVIDERS={"providers":{"github":{"clientId":"...","clientSecret":"..."}}}
 ```
 
 ```bash
-cd worker && npx wrangler dev           # 默认 http://localhost:8787
+cd worker ; npx wrangler dev           # 默认 http://localhost:8787
 ```
 
 - 创建本地账号：`curl -X POST http://localhost:8787/api/v1/admin/accounts -H "Authorization: Bearer <ADMIN_TOKEN>" -H "Content-Type: application/json" -d '{"email":"a@b.c","password":"至少12位的密码"}'`
@@ -300,15 +303,16 @@ cd worker && npx wrangler dev           # 默认 http://localhost:8787
 
 ### 核心传输开关（默认全部开启）
 
-| 开关 | 默认 | 作用 |
-| --- | --- | --- |
-| **打开 P2P**（`DSH_P2P_ENABLED`） | **开** | 在握手阶段向客户端宣告 `transport.p2p` 能力；关闭后不协商 P2P，直接走 TURN 或 DO Relay |
+| 开关                                        | 默认         | 作用                                                                                                                   |
+| ------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| **打开 P2P**（`DSH_P2P_ENABLED`）   | **开** | 在握手阶段向客户端宣告 `transport.p2p` 能力；关闭后不协商 P2P，直接走 TURN 或 DO Relay                               |
 | **打开 STUN**（`DSH_STUN_ENABLED`） | **开** | **专用于 P2P 阶段的 NAT 公网地址探测（打洞），不负责中转流量**；关闭后不下发任何 STUN（含 TURN 凭据自带的 STUN） |
-| **启用 TURN**（`DSH_TURN_ENABLED`） | **开** | P2P 打洞失败时签发 Cloudflare Realtime TURN 中继凭据；未配置密钥或关闭时退化为 Relay-only |
+| **启用 TURN**（`DSH_TURN_ENABLED`） | **开** | P2P 打洞失败时签发 Cloudflare Realtime TURN 中继凭据；未配置密钥或关闭时退化为 Relay-only                              |
 
 ### 公共 STUN 卡片管理（用于 P2P 打洞）
 
 后台「系统设置」页使用**卡片列表**管理 STUN 与 Origin 白名单，不再使用多行文本框：
+
 - **每张卡片独立控制**：支持单条**启用 / 禁用**开关、**删除**、按状态筛选（全部 / 已启用 / 已禁用）、仅启用国内推荐、全部禁用、新增自定义地址，以及一键**恢复默认列表**；同时通过 **STUN 同时启用上限**（`DSH_MAX_ENABLED_STUN`，默认 6）防止过长列表拖垮 WebRTC 12 秒超时窗口。
 - **内置完整公共列表**（`worker/src/stun.ts` 的 `PUBLIC_STUN`，共 18 条；**默认仅启用国内实测响应最快的 4 条 <70ms 节点**，其余默认禁用可按需在卡片开启）：
   - **国内推荐（默认开启，实测 39–70ms）**：斗鱼 `stun.douyucdn.cn:18000`、芒果 TV `stun.hitv.com:3478`、小米 `stun.miwifi.com:3478`、哔哩哔哩 `stun.chat.bilibili.com:3478`
@@ -318,27 +322,31 @@ cd worker && npx wrangler dev           # 默认 http://localhost:8787
 
 ### 环境变量默认值
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `DSH_P2P_ENABLED` | `true` | 是否开启 P2P 直连协商 |
-| `DSH_STUN_ENABLED` | `true` | 是否开启 STUN（用于 P2P 打洞） |
-| `DSH_STUN_URLS` | `""` | 额外自定义 STUN（逗号分隔），排在默认列表最前 |
-| `DSH_STUN_USE_PUBLIC_LIST` | `true` | 初始化时是否载入内置 18 条公共 STUN 列表 |
-| `DSH_ALLOWED_ORIGINS` | `""` | 额外允许的 Origin 白名单（逗号分隔） |
+| 变量                         | 默认     | 说明                                          |
+| ---------------------------- | -------- | --------------------------------------------- |
+| `DSH_P2P_ENABLED`          | `true` | 是否开启 P2P 直连协商                         |
+| `DSH_STUN_ENABLED`         | `true` | 是否开启 STUN（用于 P2P 打洞）                |
+| `DSH_STUN_URLS`            | `""`   | 额外自定义 STUN（逗号分隔），排在默认列表最前 |
+| `DSH_STUN_USE_PUBLIC_LIST` | `true` | 初始化时是否载入内置 18 条公共 STUN 列表      |
+| `DSH_ALLOWED_ORIGINS`      | `""`   | 额外允许的 Origin 白名单（逗号分隔）          |
 
 后台保存过的值优先级更高；点「恢复环境变量默认值」可回到上面这套配置。
 
 ## 界面预览
 
-| 概览 | 全部设备 |
-| :---: | :---: |
-| ![概览](./md/readme/overview.png) | ![全部设备](./md/readme/devices.png) |
-| **账号管理** | **实时连接** |
+|                概览                |                全部设备                |
+| :--------------------------------: | :------------------------------------: |
+|  ![概览](./md/readme/overview.png)  |   ![全部设备](./md/readme/devices.png)   |
+|      **账号管理与权限**      |           **实时连接**           |
 | ![账号管理](./md/readme/account.png) | ![实时连接](./md/readme/connections.png) |
-| **TURN 中转** | **系统设置** |
-| ![TURN 中转](./md/readme/turn.png) | ![系统设置](./md/readme/settings.png) |
-| **审计日志** | |
-| ![审计日志](./md/readme/logs.png) | |
+|        **TURN 中转**        |           **系统设置**           |
+|  ![TURN 中转](./md/readme/turn.png)  |  ![系统设置](./md/readme/settings.png)  |
+|   **OAuth 登录与扫码配对**   |          **邀请码管理**          |
+| ![OAuth 登录](./md/readme/oauth.png) |    ![邀请码](./md/readme/invite.png)    |
+|         **审计日志**         |           **我的设备**           |
+|  ![审计日志](./md/readme/logs.png)  |  ![我的设备](./md/readme/mydevices.png)  |
+|    **个人中心与 Webhook**    |           **网络诊断**           |
+| ![个人中心](./md/readme/profile.png) |   ![网络诊断](./md/readme/network.png)   |
 
 ---
 

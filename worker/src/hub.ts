@@ -8,10 +8,12 @@ import {
 } from './protocol/index.js'
 import { ApiError, Store, normEmail, type SavedDevice } from './store.js'
 import { equal, hash, secret } from './crypto.js'
+import { WH_EVENTS, WH_MAX, checkUrl, deliver, publicView, whInput, type SendResult, type WhEvent, type WhLog, type Webhook } from './webhook.js'
 import { authorizeUrl, fetchEmail, loadProviders, type ProviderCfg } from './oauth.js'
 import { createTurnKey, clearIceCache, fetchIceServers, listTurnKeys, type CfAuth, type TurnKey } from './ice.js'
 import { defaultStunServers, resolveStunUrls } from './stun.js'
 import { defaultSettings, sanitize, type Settings } from './settings.js'
+import { DEVICE_PAIRING_PROTOCOL, DEVICE_PAIRING_QR_FORMAT, PAIRING_RECOVER_TTL_MS, PairingManager } from './pairing.js'
 
 export interface Env {
   HUB: DurableObjectNamespace<Hub>
@@ -29,7 +31,7 @@ export interface Env {
 type Role = 'host' | 'client'
 type TransportName = 'lan' | 'p2p' | 'turn' | 'relay'
 /** Per-socket state; survives hibernation via serializeAttachment (<2 KiB). */
-interface Att { id?: string; account?: string; role?: Role; caps: string[]; version: string; lastPong: number; nonce?: string; created: number }
+interface Att { id?: string; account?: string; role?: Role; caps: string[]; version: string; lastPong: number; lastPingAt?: number; nonce?: string; created: number }
 type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; preferredTransports: TransportName[] }
 type Dropped = { host: string; client: string; expiresAt: number; frames: number }
 
@@ -49,13 +51,65 @@ function modernHost(version: string): boolean {
 const json = (status: number, value: unknown, headers: HeadersInit = {}): Response =>
   new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers } })
 
+const ERR_MSG: Record<string, string> = {
+  INVALID_MESSAGE: '请求参数无效或格式错误',
+  AUTH_REQUIRED: '未登录或登录已过期，请重新登录',
+  ACCOUNT_AUTH_REQUIRED: '账号登录已过期，请重新登录',
+  AUTH_INVALID: '认证失败或无权访问（账号/密码错误或来源受限）',
+  ACCOUNT_DISABLED: '该账号已被管理员禁用，请联系管理员',
+  TOKEN_EXPIRED: '设备令牌已过期，请刷新或重新登录',
+  RATE_LIMITED: '操作过于频繁或已达到数量上限，请稍后再试',
+  NOT_FOUND: '请求的资源不存在',
+  DEVICE_NOT_FOUND: '未找到指定设备',
+  DEVICE_REVOKED: '设备已被吊销，请重新配对注册',
+  PEER_IDENTITY_MISMATCH: '设备身份密钥或角色不匹配',
+  CONNECTION_NOT_FOUND: '连接不存在或已断开',
+  CONNECTION_FAILED: '目标设备不在线或连接失败',
+  MEMBERSHIP_REQUIRED: '当前设备角色无权执行此操作',
+  PERMISSION_DENIED: '当前账号无权访问该管理模块，请联系根管理员授权',
+  METHOD_NOT_FOUND: '请求的接口不存在',
+  FRAME_TOO_LARGE: '请求内容过大',
+  UNSUPPORTED_VERSION: '协议版本不受支持',
+  CAPABILITY_NOT_SUPPORTED: '目标设备不支持请求的传输方式',
+  HELLO_TIMEOUT: 'WebSocket 握手超时，请重试',
+  WEBHOOK_NOT_FOUND: '未找到指定的 Webhook',
+  WEBHOOK_FAILED: 'Webhook 投递失败',
+  INVALID_WEBHOOK_URL: 'Webhook 地址无效或不允许内网地址',
+  INVITE_INVALID: '邀请码无效、已过期或已用完',
+  INVITE_EXISTS: '该邀请码已存在',
+  INVITE_SESSION_EXPIRED: '邀请码验证会话已过期，请重新发起登录',
+  OAUTH_DISABLED: '该第三方登录方式未启用',
+  OAUTH_REGISTER_DISABLED: '该第三方登录未开启自动注册',
+  OAUTH_EMAIL_BLOCKED: '该邮箱已被列入禁止注册黑名单',
+  OAUTH_DOMAIN_NOT_ALLOWED: '该邮箱域名不在允许注册的白名单内',
+  OAUTH_STATE_INVALID: '第三方登录状态已失效，请重新发起',
+  OAUTH_TOKEN_FAILED: '第三方登录换取令牌失败，请检查密钥与回调地址',
+  OAUTH_EMAIL_UNVERIFIED: '第三方账号邮箱未通过验证，无法登录',
+  OAUTH_FAILED: '第三方登录失败，请稍后重试',
+  HOST_CODE_INVALID: '主机匹配码无效或已过期，请重新生成',
+  PAIRING_UNSUPPORTED: '服务端未启用扫码配对功能',
+  PAIRING_NOT_FOUND: '配对会话不存在',
+  PAIRING_EXPIRED: '配对二维码已过期，请重新生成',
+  PAIRING_CLOSED: '配对会话已关闭',
+  PAIRING_PROOF_INVALID: '配对签名校验失败',
+  PAIRING_IDENTITY_MISMATCH: '配对设备身份不匹配',
+  PAIRING_NOT_CLAIMED: '配对尚未被手机端认领',
+  CLOUDFLARE_API_ERROR: 'Cloudflare TURN API 调用失败',
+  INTERNAL_ERROR: '服务器内部错误，请稍后重试',
+}
+
+const ALL_ADMIN_PERMS = ['overview', 'devices', 'accounts', 'links', 'turn', 'settings', 'oauth', 'invites', 'events'] as const
+type AdminPerm = (typeof ALL_ADMIN_PERMS)[number]
+
 export class Hub extends DurableObject<Env> {
   private store: Store
+  private pairing: PairingManager
   private cfg: Settings
   private turn?: TurnKey
   private startedAt = Date.now()
   private events: { t: number; type: string; detail: string; actor: string }[] = []
   private admins = new Set<string>()
+  private adminPerms: Record<string, AdminPerm[]> = {}
   private oauthCustom: Record<string, ProviderCfg> = {}
   private links: Record<string, Link> = {}
   private dropped = new Map<string, Dropped>()
@@ -64,10 +118,13 @@ export class Hub extends DurableObject<Env> {
   private rate = new Map<string, { count: number; until: number }>()
   private windows = new WeakMap<WebSocket, { start: number; frames: number }>()
   private peerCache?: Map<string, { ws: WebSocket; att: Att }>
+  private hasPendingOffline = true
+  private hasExpiring = false
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     this.store = new Store(ctx.storage)
+    this.pairing = new PairingManager(ctx.storage, this.store)
     this.cfg = defaultSettings(env)
     if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) this.turn = { keyId: String(env.TURN_KEY_ID).trim(), apiToken: String(env.TURN_KEY_API_TOKEN).trim() }
     this.store.onInvalidate = id => { void this.disconnect(id, 'AUTH_INVALID') }
@@ -87,6 +144,7 @@ export class Hub extends DurableObject<Env> {
       this.turn = (await ctx.storage.get<TurnKey>('turn')) ?? this.turn
       this.events = (await ctx.storage.get<typeof this.events>('events')) ?? []
       this.admins = new Set((await ctx.storage.get<string[]>('admins')) ?? [])
+      this.adminPerms = (await ctx.storage.get<Record<string, AdminPerm[]>>('admin_perms')) ?? {}
       this.oauthCustom = (await ctx.storage.get<Record<string, ProviderCfg>>('oauth_custom')) ?? {}
     })
   }
@@ -159,25 +217,59 @@ export class Hub extends DurableObject<Env> {
   async disconnect(id: string, code: string): Promise<void> {
     this.peerCache?.delete(id)
     for (const link of Object.values(this.links)) if (link.host === id || link.client === id) this.drop(link, code)
+    let hostAcct: string | undefined
     for (const { ws, att } of this.sockets()) {
       if (att.id !== id) continue
+      if (att.role === 'host' && att.account) hostAcct = att.account
       this.setAtt(ws, { ...att, id: undefined, role: undefined }) // webSocketClose must not re-disconnect
       try { ws.close(code === 'CONNECTION_REPLACED' ? 4003 : 4001, code) } catch { /* already closed */ }
     }
+    if (hostAcct && code !== 'CONNECTION_REPLACED') this.ctx.waitUntil(this.onHostDisconnect(hostAcct, id))
   }
 
   // ---------------- HTTP / WS entry ----------------
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url)
+    const origin = req.headers.get('Origin')
+    const crossOrigin = origin && origin !== url.origin && this.cfg.allowedOrigins.includes(origin) ? origin : null
+    const addCors = (res: Response): Response => {
+      if (!crossOrigin || res.webSocket) return res
+      const h = new Headers(res.headers)
+      h.set('Access-Control-Allow-Origin', crossOrigin)
+      h.set('Access-Control-Allow-Credentials', 'true')
+      h.set('Vary', 'Origin')
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
+    }
     try {
-      const origin = req.headers.get('Origin')
-      if (origin && origin !== url.origin && !this.cfg.allowedOrigins.includes(origin)) throw new ApiError('AUTH_INVALID', 403)
+      if (origin && origin !== url.origin && !crossOrigin) throw new ApiError('AUTH_INVALID', 403)
+      if (req.method === 'OPTIONS' && crossOrigin) {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': crossOrigin,
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-DSH-Pairing-Proof',
+            'Access-Control-Max-Age': '86400',
+            Vary: 'Origin',
+          },
+        })
+      }
       if (url.pathname === '/ws/v1/connect' && req.headers.get('Upgrade') === 'websocket') return this.accept(url)
-      return await this.route(req, url)
+      return addCors(await this.route(req, url))
     } catch (error) {
-      const e = error instanceof ApiError ? error : error instanceof z.ZodError ? new ApiError('INVALID_MESSAGE') : new ApiError('INTERNAL_ERROR', 500)
-      if (!(error instanceof ApiError) && !(error instanceof z.ZodError)) console.error('internal', String(error))
-      return json(e.status, { error: { code: e.code, message: e.code, requestId: crypto.randomUUID(), retryable: e.status === 429 || e.status >= 500 } }, e.status === 429 ? { 'Retry-After': '60' } : {})
+      let e: ApiError
+      if (error instanceof ApiError) e = error
+      else if (error instanceof z.ZodError) {
+        const iss = error.issues[0]
+        const path = iss?.path?.length ? `${iss.path.join('.')}: ` : ''
+        e = new ApiError('INVALID_MESSAGE', 400, `参数校验失败 (${path}${iss?.message ?? '格式无效'})`)
+      } else {
+        console.error('internal', String(error))
+        e = new ApiError('INTERNAL_ERROR', 500)
+      }
+      const message = e.detail || ERR_MSG[e.code] || e.code
+      return addCors(json(e.status, { error: { code: e.code, message, requestId: crypto.randomUUID(), retryable: e.status === 429 || e.status >= 500 } }, e.status === 429 ? { 'Retry-After': '60' } : {}))
     }
   }
 
@@ -198,6 +290,12 @@ export class Hub extends DurableObject<Env> {
     let e = this.rate.get(key)
     if (!e || e.until < now) { e = { count: 0, until: now + 60_000 }; this.rate.set(key, e) }
     if (++e.count > max) throw new ApiError('RATE_LIMITED', 429)
+  }
+  private async rawBody(req: Request): Promise<string> {
+    const text = await req.text()
+    if (text.length > 16384) throw new ApiError('FRAME_TOO_LARGE', 413)
+    try { parseWireJson(text) } catch { throw new ApiError('INVALID_MESSAGE') }
+    return text
   }
   private async body(req: Request): Promise<unknown> {
     if (!req.headers.get('content-type')?.toLowerCase().startsWith('application/json')) throw new ApiError('INVALID_MESSAGE', 415)
@@ -226,7 +324,13 @@ export class Hub extends DurableObject<Env> {
     if (method === 'GET' && ['/health', '/healthz', '/ready'].includes(path)) return json(200, { status: 'ok' })
     const ip = req.headers.get('CF-Connecting-IP') ?? 'unknown'
     this.limit(`api:${ip}`, 240)
-    const profile = (account: string) => ({ account, profile: { displayName: account }, isAdmin: this.isAdminAccount(account) })
+    const profile = (account: string) => ({
+      account,
+      profile: { displayName: account },
+      isAdmin: this.isAdminAccount(account),
+      rootAdmin: this.isEnvAdmin(account),
+      adminPerms: this.adminPermsOf(account),
+    })
 
     if (method === 'POST' && path === '/api/v1/auth/login') {
       this.limit(`login:${ip}`, 20)
@@ -244,10 +348,10 @@ export class Hub extends DurableObject<Env> {
       return json(200, { ok: true, ts: Date.now(), stunServers: this.cfg.stunServers.filter(s => s.enabled).map(s => s.url) })
     }
     if (method === 'GET' && path === '/api/v1/account/profile') {
-      const a = await this.accountAuth(req)
+      const { account: a, id: curSid } = await this.store.sessionInfo(this.bearer(req))
       const acct = await this.store.getAccount(a)
       const oauthInit = !!(await this.ctx.storage.get(`oauthpw:${normEmail(a)}`))
-      const sessions = await this.store.listSessions(a)
+      const sessions = await this.store.listSessions(a, curSid)
       return json(200, {
         email: a, isAdmin: this.isAdminAccount(a), hasPassword: !oauthInit,
         disabled: !!acct?.disabled, maxDevices: acct?.maxDevices ?? this.cfg.maxDevicesPerAccount,
@@ -256,22 +360,27 @@ export class Hub extends DurableObject<Env> {
     }
     if (method === 'POST' && path === '/api/v1/account/password') {
       const a = await this.accountAuth(req)
-      const b = await this.body(req) as { currentPassword?: unknown; newPassword?: unknown }
+      const b = await this.body(req) as { currentPassword?: unknown; oldPassword?: unknown; newPassword?: unknown }
       const newPw = typeof b.newPassword === 'string' ? b.newPassword : ''
-      if (newPw.length < 12 || newPw.length > 1024) throw new ApiError('INVALID_MESSAGE')
-      const oauthInit = !!(await this.ctx.storage.get(`oauthpw:${normEmail(a)}`))
-      if (!oauthInit) {
-        const cur = typeof b.currentPassword === 'string' ? b.currentPassword : ''
+      if (newPw.length < 12 || newPw.length > 1024) throw new ApiError('INVALID_MESSAGE', 400, '新密码长度需在 12-1024 位之间')
+      const mk = `oauthpw:${normEmail(a)}`
+      if (!(await this.ctx.storage.get(mk))) {
+        const cur = typeof b.currentPassword === 'string' ? b.currentPassword : (typeof b.oldPassword === 'string' ? b.oldPassword : '')
         await this.store.verifyLogin(a, cur)
       }
       await this.store.upsertAccount(a, newPw)
-      if (oauthInit) await this.ctx.storage.delete(`oauthpw:${normEmail(a)}`)
+      await this.ctx.storage.delete(mk)
+      const s = await this.store.createSession(a, req.headers.get('user-agent') ?? '')
       await this.log('account.password.changed', a, a)
-      return json(200, { ok: true })
+      return json(200, { ok: true, expiresAt: s.expiresAt }, { 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) })
     }
     if (method === 'GET' && path === '/api/v1/account/sessions') {
-      const a = await this.accountAuth(req)
-      return json(200, { items: await this.store.listSessions(a) })
+      const { account: a, id: curSid } = await this.store.sessionInfo(this.bearer(req))
+      return json(200, { items: await this.store.listSessions(a, curSid) })
+    }
+    if (method === 'DELETE' && path === '/api/v1/account/sessions-others') {
+      const { account: a, id: curSid } = await this.store.sessionInfo(this.bearer(req))
+      return json(200, { ok: true, removed: await this.store.deleteOtherSessions(a, curSid) })
     }
     const sesDel = /^\/api\/v1\/account\/sessions\/([A-Za-z0-9_-]{6,32})$/.exec(path)
     if (method === 'DELETE' && sesDel) {
@@ -288,6 +397,9 @@ export class Hub extends DurableObject<Env> {
     }
     if (method === 'POST' && path === '/api/v1/account/host-registration-codes') {
       const a = await this.accountAuth(req)
+      const now = Date.now()
+      const mine = [...(await this.ctx.storage.list<{ account: string; expiresAt: number }>({ prefix: 'hostcode:' })).values()].filter(v => v.account === a && v.expiresAt > now)
+      if (mine.length >= 5) throw new ApiError('RATE_LIMITED', 429, '每个账号最多同时保留 5 个有效匹配码')
       const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
       const pick = (n: number) => Array.from(crypto.getRandomValues(new Uint8Array(n)), x => chars[x % chars.length]).join('')
       const code = `${pick(4)}-${pick(4)}`
@@ -318,32 +430,39 @@ export class Hub extends DurableObject<Env> {
       await this.store.rename(a, id, name)
       return json(200, { ok: true })
     }
-    if (path === '/api/v1/account/webhooks') {
+    if (path === '/api/v1/account/webhooks' && (method === 'GET' || method === 'POST')) {
       const a = await this.accountAuth(req)
-      if (method === 'GET') return json(200, { items: await this.getWebhooks(a) })
-      if (method === 'POST') {
-        const b = z.object({
-          id: z.string().trim().max(32).optional(),
-          name: z.string().trim().max(64).optional(),
-          url: z.string().trim().url().max(512),
-          enabled: z.boolean().optional(),
-          events: z.array(z.enum(['host_offline', 'device_registered'])).optional(),
-          deviceIds: z.array(z.string().trim().max(128)).max(64).optional(),
-        }).parse(await this.body(req))
-        const list = await this.getWebhooks(a)
-        const id = b.id || secret().slice(0, 10)
-        const item = { id, name: b.name || 'Webhook', url: b.url, enabled: b.enabled ?? true, events: b.events ?? ['host_offline', 'device_registered'], deviceIds: (b.deviceIds ?? []).filter(Boolean) }
-        const idx = list.findIndex(x => x.id === id)
-        if (idx >= 0) list[idx] = item; else list.push(item)
-        await this.ctx.storage.put(`webhooks:${a}`, list)
-        return json(200, item)
-      }
+      if (method === 'GET') return json(200, { items: (await this.getWebhooks(a)).map(publicView), max: WH_MAX, logs: (await this.ctx.storage.get<WhLog[]>(`whlog:${a}`)) ?? [] })
+      const b = whInput.parse(await this.body(req))
+      const list = await this.getWebhooks(a)
+      const old = b.id ? list.find(x => x.id === b.id) : undefined
+      if (!old && !b.url) throw new ApiError('INVALID_MESSAGE', 400, '请提供 Webhook URL')
+      if (!old && list.length >= WH_MAX) throw new ApiError('RATE_LIMITED', 429, `最多只能添加 ${WH_MAX} 个 Webhook`)
+      const url = b.url ?? old!.url
+      const bad = checkUrl(url)
+      if (bad) throw new ApiError('INVALID_WEBHOOK_URL', 400, bad)
+      const item: Webhook = {
+        ...(old ?? { id: secret().slice(0, 10), createdAt: Date.now() }),
+        name: b.name ?? old?.name ?? '',
+        url, enabled: b.enabled ?? old?.enabled ?? true,
+        events: b.events ?? old?.events ?? [...WH_EVENTS],
+        deviceIds: b.deviceIds ?? old?.deviceIds ?? [],
+        secret: b.secret === undefined ? old?.secret : (b.secret || undefined),
+      } as Webhook
+      const idx = list.findIndex(x => x.id === item.id)
+      if (idx >= 0) list[idx] = item; else list.push(item)
+      await this.ctx.storage.put(`webhooks:${a}`, list)
+      return json(200, publicView(item))
     }
     const whDel = /^\/api\/v1\/account\/webhooks\/([A-Za-z0-9_-]{1,32})$/.exec(path)
     if (method === 'DELETE' && whDel) {
       const a = await this.accountAuth(req)
-      const list = (await this.getWebhooks(a)).filter(x => x.id !== whDel[1])
-      await this.ctx.storage.put(`webhooks:${a}`, list)
+      await this.ctx.storage.put(`webhooks:${a}`, (await this.getWebhooks(a)).filter(x => x.id !== whDel[1]))
+      return json(200, { ok: true })
+    }
+    if (method === 'DELETE' && path === '/api/v1/account/webhooks-logs') {
+      const a = await this.accountAuth(req)
+      await this.ctx.storage.delete(`whlog:${a}`)
       return json(200, { ok: true })
     }
     if (method === 'POST' && path === '/api/v1/account/webhooks/test') {
@@ -352,14 +471,16 @@ export class Hub extends DurableObject<Env> {
       const list = await this.getWebhooks(a)
       const target = b?.id ? list.find(x => x.id === b.id) : list[0]
       if (!target) throw new ApiError('WEBHOOK_NOT_FOUND', 404)
-      const res = await this.sendOneWebhook(target.url, a, 'device_registered', { test: true, message: 'DSH Remote Webhook 测试通知' })
-      if (!res.ok) return json(400, { error: { code: 'WEBHOOK_FAILED', message: res.error ?? 'Webhook 请求失败' } })
-      return json(200, res)
+      const res = await this.runWebhook(a, target, 'device_registered', { test: true, deviceId: 'test-device', displayName: '测试设备' })
+      return json(res.ok ? 200 : 400, res.ok ? res : { error: { code: 'WEBHOOK_FAILED', message: res.error ?? 'Webhook 请求失败', requestId: crypto.randomUUID(), retryable: false }, ...res })
     }
     // ---- OAuth login (providers from provider.json -> OAUTH_PROVIDERS secret) ----
     if (method === 'GET' && path === '/api/v1/auth/oauth/providers') {
       const ov = await this.oauthOverrides()
       return json(200, {
+        capabilities: this.cfg.devicePairingEnabled
+          ? { devicePairing: DEVICE_PAIRING_PROTOCOL, devicePairingQr: DEVICE_PAIRING_QR_FORMAT }
+          : {},
         items: loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom)
           .filter(p => ov[p.id]?.enabled ?? p.enabled)
           .map(p => ({ id: p.id, displayName: p.displayName, startUrl: `/api/v1/auth/oauth/${p.id}/start`, qrStartUrl: `/api/v1/auth/oauth/qr/start?provider=${p.id}` })),
@@ -386,11 +507,12 @@ export class Hub extends DurableObject<Env> {
     const qm = /^\/api\/v1\/auth\/q\/([A-Za-z0-9_-]{8,64})$/.exec(path)
     if (method === 'GET' && qm) {
       this.limit(`oauth:${ip}`, 30)
+      const errHtml = (title: string, msg: string, status: number) => new Response(`<!doctype html><meta charset="utf-8"><title>${title} · DSH Remote</title><body style="font-family:sans-serif;display:grid;place-items:center;min-height:100vh;background:#0b0d12;color:#e8ebf2"><div style="text-align:center"><h2>${title}</h2><p>${msg}</p></div></body>`, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
       const q = await this.ctx.storage.get<{ id: string; exp: number; status: string }>(`qr:${qm[1]}`)
-      if (!q || q.exp < Date.now()) return new Response('QR expired', { status: 410 })
+      if (!q || q.exp < Date.now()) return errHtml('二维码已过期', '该登录二维码已失效，请返回客户端重新生成。', 410)
       const p = loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).find(x => x.id === q.id)
-      if (!p) return new Response('OAuth not configured', { status: 400 })
-      if (!q || q.exp < Date.now()) return new Response('QR expired', { status: 410 })
+      const ov = (await this.oauthOverrides())[q.id]
+      if (!p || !(ov?.enabled ?? p.enabled)) return errHtml('登录方式未启用', '管理员尚未配置或已停用该第三方登录方式。', 400)
       const state = secret(), secure = url.protocol === 'https:' ? '; Secure' : ''
       await this.ctx.storage.put(`ostate:${await hash(state)}`, { id: p.id, exp: Date.now() + 600_000, qrId: qm[1] })
       return new Response(null, { status: 302, headers: { Location: authorizeUrl(p, `${url.origin}/api/v1/auth/oauth/${p.id}/callback`, state), 'Set-Cookie': `dsh_oauth=${state}; Path=/api/v1/auth/oauth; HttpOnly; SameSite=Lax; Max-Age=600${secure}` } })
@@ -411,11 +533,13 @@ export class Hub extends DurableObject<Env> {
       const invCode = b.code.toUpperCase().replace(/[^A-Z0-9_-]/g, '')
       const inv = await this.ctx.storage.get<{ code: string; maxUses: number; uses: number; expiresAt: number; usedBy?: Array<{ email: string; at: number }> }>(`invite:${invCode}`)
       if (!inv || (inv.expiresAt > 0 && inv.expiresAt < Date.now()) || inv.uses >= inv.maxUses) throw new ApiError('INVITE_INVALID', 400)
-      inv.uses += 1
-      inv.usedBy = [...(inv.usedBy ?? []), { email: pending.email, at: Date.now() }]
-      await this.ctx.storage.put(`invite:${invCode}`, inv)
       await this.ctx.storage.delete(`oinvite:${b.token}`)
-      if (!(await this.store.getAccount(pending.email))) {
+      const existInv = await this.store.getAccount(pending.email)
+      if (existInv?.disabled) throw new ApiError('ACCOUNT_DISABLED', 403)
+      if (!existInv) {
+        inv.uses += 1
+        inv.usedBy = [...(inv.usedBy ?? []), { email: pending.email, at: Date.now() }]
+        await this.ctx.storage.put(`invite:${invCode}`, inv)
         await this.store.upsertAccount(pending.email, secret())
         await this.ctx.storage.put(`oauthpw:${pending.email}`, true)
         await this.log('oauth.register', `${pending.providerId} ${pending.email} invite:${invCode}`, pending.email)
@@ -426,7 +550,7 @@ export class Hub extends DurableObject<Env> {
         const q = await this.ctx.storage.get<{ id: string; exp: number }>(`qr:${pending.qrId}`)
         if (q && q.exp >= Date.now()) await this.ctx.storage.put(`qr:${pending.qrId}`, { ...q, status: 'confirmed', token: s.value, account: pending.email, expiresAt: s.expiresAt })
         if (ct.includes('application/x-www-form-urlencoded')) {
-          return new Response('<!doctype html><meta charset="utf-8"><title>授权成功</title><body style="font-family:sans-serif;display:grid;place-items:center;min-height:100vh;background:#0b0d12;color:#e8ebf2"><div style="text-align:center"><h2>授权成功</h2><p>已完成注册并授权，请关闭此页面并返回客户端继续。</p></div></body>', { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+          return new Response('<!doctype html><meta charset="utf-8"><title>授权成功 · DSH Remote</title><body style="font-family:sans-serif;display:grid;place-items:center;min-height:100vh;background:#0b0d12;color:#e8ebf2"><div style="text-align:center"><h2>授权成功</h2><p>已完成注册并授权，请关闭此页面并返回客户端继续。</p></div></body>', { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
         }
         return json(200, { ok: true, qr: true })
       }
@@ -457,7 +581,9 @@ export class Hub extends DurableObject<Env> {
       if (!code || !saved || saved.id !== p.id || saved.exp < Date.now() || ck !== state) return fail('OAUTH_STATE_INVALID')
       try {
         const email = normEmail(await fetchEmail(p, code, redirect))
-        if (!(await this.store.getAccount(email))) {
+        const existCb = await this.store.getAccount(email)
+        if (existCb?.disabled) return fail('ACCOUNT_DISABLED')
+        if (!existCb) {
           if (!(ov?.allowRegister ?? p.allowRegister)) return fail('OAUTH_REGISTER_DISABLED')
           const dom = email.split('@')[1] ?? ''
           if (this.cfg.oauthBlockedDomains.includes(email) || this.cfg.oauthBlockedDomains.includes(dom)) return fail('OAUTH_EMAIL_BLOCKED')
@@ -472,7 +598,7 @@ export class Hub extends DurableObject<Env> {
           await this.ctx.storage.put(`oauthpw:${email}`, true)
           await this.log('oauth.register', `${p.id} ${email}`, email)
         }
-        const s = await this.store.createSession(email)
+        const s = await this.store.createSession(email, req.headers.get('user-agent') ?? '')
         await this.log('login', `oauth:${p.id} ${ip}`, email)
         if (saved.qrId) {
           const q = await this.ctx.storage.get<{ id: string; exp: number }>(`qr:${saved.qrId}`)
@@ -496,6 +622,39 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
         return new Response(null, { status: 302, headers: h })
       } catch (e) { return fail(e instanceof ApiError ? e.code : 'OAUTH_FAILED') }
     }
+    // ---- DSH Go device pairing (dsh-pairing-v1) ----
+    if (path.startsWith('/api/v1/device-pairing/')) {
+      if (!this.cfg.devicePairingEnabled) throw new ApiError('PAIRING_UNSUPPORTED', 404)
+      if (method === 'POST' && path === '/api/v1/device-pairing/sessions') {
+        this.limit(`pair:${ip}`, 30)
+        const out = await this.pairing.createSession(url.origin, await this.rawBody(req))
+        this.hasExpiring = true
+        await this.ensureAlarm(PAIRING_RECOVER_TTL_MS)
+        return json(200, out)
+      }
+      if (method === 'POST' && path === '/api/v1/device-pairing/resolve') {
+        this.limit(`pair:${ip}`, 60)
+        return json(200, await this.pairing.resolve(await this.rawBody(req)))
+      }
+      const pm = /^\/api\/v1\/device-pairing\/sessions\/([0-9a-fA-F-]{36})\/(claim|mobile\/status|mobile\/cancel|host\/status|host\/confirm|host\/cancel)$/.exec(path)
+      if (method === 'POST' && pm) {
+        const [, sid, op] = pm
+        const raw = await this.rawBody(req)
+        if (op === 'claim') {
+          this.limit(`pair:${ip}`, 30)
+          return json(200, await this.pairing.claim(req, sid!, path, raw))
+        }
+        if (op === 'mobile/status') return json(200, await this.pairing.mobileStatus(req, sid!, path, raw))
+        if (op === 'mobile/cancel') return json(200, await this.pairing.cancel(req, sid!, 'mobile', path, raw))
+        if (op === 'host/status') return json(200, await this.pairing.hostStatus(req, sid!, path, raw))
+        if (op === 'host/cancel') return json(200, await this.pairing.cancel(req, sid!, 'host', path, raw))
+        if (op === 'host/confirm') {
+          const res = await this.pairing.hostConfirm(req, sid!, path, raw)
+          if (res.account) await this.log('pairing.complete', res.account, 'device-pairing')
+          return json(200, res.body)
+        }
+      }
+    }
     if (method === 'POST' && path === '/api/v1/auth/logout') {
       await this.store.deleteSession(this.bearer(req))
       return json(200, { status: 'ok' }, { 'Set-Cookie': this.cookie('', 0, url) })
@@ -503,17 +662,6 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
     if (method === 'GET' && path === '/api/v1/account/devices') {
       const account = await this.store.session(this.bearer(req))
       return json(200, { items: await Promise.all((await this.store.list(account)).map(d => this.describe(d))), serverUrl: url.origin, transport: 'webrtc' })
-    }
-    if (method === 'POST' && path === '/api/v1/account/password') {
-      const account = await this.store.session(this.bearer(req))
-      const b = z.object({ oldPassword: z.string().max(1024).optional(), newPassword: z.string().min(12).max(1024) }).parse(await this.body(req))
-      const mk = `oauthpw:${normEmail(account)}` // OAuth-created accounts have an unknown random password: no old password needed once
-      if (!(await this.ctx.storage.get(mk))) await this.store.verifyLogin(account, b.oldPassword ?? '')
-      await this.store.upsertAccount(account, b.newPassword)
-      await this.ctx.storage.delete(mk)
-      const s = await this.store.createSession(account)
-      await this.log('account.password', account, account)
-      return json(200, { status: 'ok', expiresAt: s.expiresAt }, { 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) })
     }
     const delMyDev = /^\/api\/v1\/account\/devices\/([^/]+)$/.exec(path)
     if (method === 'DELETE' && delMyDev) {
@@ -524,15 +672,37 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
       await this.log('device.revoke', target.descriptor.deviceId, account)
       return json(200, { status: 'revoked' })
     }
+    if (method === 'POST' && (path === '/api/v1/devices/register-by-code' || path === '/api/v1/devices/register-with-code')) {
+      this.limit(`devreg:${ip}`, 30)
+      const b = z.object({ code: z.string().trim().min(4).max(32), device: z.any() }).parse(await this.body(req))
+      const code = b.code.toUpperCase()
+      const rec = await this.ctx.storage.get<{ account: string; code: string; expiresAt: number }>(`hostcode:${code}`)
+      if (!rec || rec.expiresAt <= Date.now()) {
+        if (rec) await this.ctx.storage.delete(`hostcode:${code}`)
+        throw new ApiError('HOST_CODE_INVALID', 400)
+      }
+      const { device } = deviceRegistrationRequestSchema.parse({ v: 1, device: b.device })
+      const existed = (await this.store.list(rec.account)).some(d => d.descriptor.deviceId === device.deviceId)
+      const out = await this.store.register(rec.account, device)
+      await this.ctx.storage.delete(`hostcode:${code}`)
+      if (!existed) this.ctx.waitUntil(this.sendWebhook(rec.account, 'device_registered', { deviceId: device.deviceId, role: device.role }))
+      return json(200, { ...out, account: rec.account })
+    }
     if (method === 'POST' && (path === '/api/v1/devices/register' || path === '/api/v1/devices/register-owned-role')) {
+      this.limit(`devreg:${ip}`, 30)
       const owned = path.endsWith('register-owned-role')
       const source = owned ? await this.deviceAuth(req) : undefined
+      if (source?.pairingRestricted) throw new ApiError('MEMBERSHIP_REQUIRED', 403, '扫码配对的受限设备无权注册其他角色设备')
       const account = source ? source.account : await this.store.session(this.bearer(req))
       const { device } = deviceRegistrationRequestSchema.parse(await this.body(req))
       if (source && (source.descriptor.deviceId === device.deviceId || source.descriptor.role === device.role)) throw new ApiError('INVALID_MESSAGE', 409)
-      return json(200, await this.store.register(account, device))
+      const existed = (await this.store.list(account)).some(d => d.descriptor.deviceId === device.deviceId)
+      const out = await this.store.register(account, device)
+      if (!existed) this.ctx.waitUntil(this.sendWebhook(account, 'device_registered', { deviceId: device.deviceId, role: device.role }))
+      return json(200, out)
     }
     if (method === 'POST' && path === '/api/v1/auth/refresh') {
+      this.limit(`refresh:${ip}`, 60)
       const d = deviceRefreshRequestSchema.parse(await this.body(req))
       return json(200, await this.store.refresh(d.deviceId, d.refreshToken))
     }
@@ -587,53 +757,105 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
     }
     return this.oauthOverridesCache
   }
-  private async getWebhooks(account: string): Promise<Array<{ id: string; name: string; url: string; enabled: boolean; events: string[]; deviceIds: string[] }>> {
-    const list = await this.ctx.storage.get<Array<{ id: string; name: string; url: string; enabled: boolean; events: string[]; deviceIds: string[] }>>(`webhooks:${account}`)
+  private async getWebhooks(account: string): Promise<Webhook[]> {
+    const list = await this.ctx.storage.get<Webhook[]>(`webhooks:${account}`)
     if (list) return list
-    const legacy = await this.ctx.storage.get<{ url: string; enabled: boolean; events: string[]; deviceIds?: string[] }>(`webhook:${account}`)
-    if (legacy?.url) return [{ id: 'default', name: '默认 Webhook', url: legacy.url, enabled: legacy.enabled, events: legacy.events ?? ['host_offline', 'device_registered'], deviceIds: legacy.deviceIds ?? [] }]
+    const legacy = await this.ctx.storage.get<{ url: string; enabled: boolean; events: WhEvent[]; deviceIds?: string[] }>(`webhook:${account}`)
+    if (legacy?.url) return [{ id: 'default', name: '默认 Webhook', url: legacy.url, enabled: legacy.enabled, events: legacy.events ?? [...WH_EVENTS], deviceIds: legacy.deviceIds ?? [] }]
     return []
   }
-  private async sendOneWebhook(url: string, account: string, event: 'host_offline' | 'device_registered', payload: Record<string, unknown>): Promise<{ ok: boolean; status?: number; error?: string }> {
-    const text = `[DSH Remote] ${event === 'host_offline' ? '主机离线告警' : '新设备接入'} (${account}) ${payload.deviceId ? `设备: ${payload.deviceId}` : ''}`.trim()
-    const plat = (url.includes('open.feishu.cn') || url.includes('open.larksuite.com')) ? 'feishu'
-      : url.includes('oapi.dingtalk.com') ? 'dingtalk'
-      : url.includes('qyapi.weixin.qq.com') ? 'wecom'
-      : url.includes('discord.com/api/webhooks') ? 'discord'
-      : 'custom'
-    let bodyObj: unknown = { event, account, timestamp: Date.now(), msg: text, ...payload }
-    if (plat === 'feishu') bodyObj = { msg_type: 'text', content: { text } }
-    else if (plat === 'dingtalk' || plat === 'wecom') bodyObj = { msgtype: 'text', text: { content: text } }
-    else if (plat === 'discord') bodyObj = { content: text }
-    try {
-      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyObj), signal: AbortSignal.timeout(8000) })
-      return res.ok ? { ok: true, status: res.status } : { ok: false, status: res.status, error: `HTTP ${res.status}` }
-    } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : String(e) }
-    }
-  }
-  private async sendWebhook(account: string, event: 'host_offline' | 'device_registered', payload: Record<string, unknown>): Promise<void> {
-    const list = await this.getWebhooks(account)
-    for (const cfg of list) {
-      if (!cfg.enabled || !cfg.url || !cfg.events.includes(event)) continue
-      if (cfg.deviceIds?.length && typeof payload.deviceId === 'string' && !cfg.deviceIds.includes(payload.deviceId)) continue
-      await this.sendOneWebhook(cfg.url, account, event, payload)
-    }
-  }
-  private async cleanupExpired(): Promise<void> {
+  /** Deliver one webhook, persist status on the item and append to a capped delivery log. */
+  private async runWebhook(account: string, w: Webhook, event: WhEvent, payload: Record<string, unknown>): Promise<SendResult> {
+    const r = await deliver(w, event, account, payload)
     const now = Date.now()
-    if (now - this.lastCleanupAt < 300_000) return
+    const list = await this.getWebhooks(account)
+    const cur = list.find(x => x.id === w.id)
+    if (cur) {
+      Object.assign(cur, { lastAt: now, lastOk: r.ok, lastStatus: r.status, lastError: r.error, okCount: (cur.okCount ?? 0) + (r.ok ? 1 : 0), failCount: (cur.failCount ?? 0) + (r.ok ? 0 : 1) })
+      await this.ctx.storage.put(`webhooks:${account}`, list)
+    }
+    const logs = (await this.ctx.storage.get<WhLog[]>(`whlog:${account}`)) ?? []
+    logs.unshift({ t: now, id: w.id, event: payload.test ? 'test' : event, ok: r.ok, status: r.status, error: r.error, ms: r.ms })
+    await this.ctx.storage.put(`whlog:${account}`, logs.slice(0, 50))
+    return r
+  }
+  private async sendWebhook(account: string, event: WhEvent, payload: Record<string, unknown>, filter?: (c: Webhook) => boolean): Promise<string[]> {
+    const targets = (await this.getWebhooks(account)).filter(c => c.enabled && c.url && c.events.includes(event)
+      && !(c.deviceIds?.length && typeof payload.deviceId === 'string' && !c.deviceIds.includes(payload.deviceId)) && (!filter || filter(c)))
+    if (!targets.length) return []
+    await Promise.allSettled(targets.map(c => this.runWebhook(account, c, event, payload)))
+    return targets.map(c => c.id)
+  }
+  private async onHostDisconnect(account: string, deviceId: string): Promise<void> {
+    const dev = await this.store.get(deviceId).catch(() => undefined)
+    const displayName = dev?.descriptor.role === 'host' ? dev.descriptor.name : undefined
+    const immIds = await this.sendWebhook(account, 'host_offline', { deviceId, displayName }, c => !c.offlineDelaySec)
+    if (immIds.length) {
+      const prev = (await this.ctx.storage.get<string[]>(`whsent:${deviceId}`)) ?? []
+      await this.ctx.storage.put(`whsent:${deviceId}`, [...new Set([...prev, ...immIds])])
+    }
+    const delayed = (await this.getWebhooks(account)).filter(c => c.enabled && c.events.includes('host_offline') && (c.offlineDelaySec ?? 0) > 0
+      && !(c.deviceIds?.length && !c.deviceIds.includes(deviceId)))
+    if (delayed.length) {
+      const now = Date.now()
+      const items = delayed.map(c => ({ id: c.id, due: now + (c.offlineDelaySec ?? 0) * 1000 }))
+      const minMs = Math.min(...delayed.map(c => c.offlineDelaySec ?? 0)) * 1000
+      await this.ctx.storage.put(`whoff:${deviceId}`, { account, items, displayName })
+      this.hasPendingOffline = true
+      await this.ensureAlarm(minMs)
+    }
+  }
+  private async processPendingOffline(now: number): Promise<number | null> {
+    if (!this.hasPendingOffline) return null
+    const entries = await this.ctx.storage.list<{ account: string; due?: number; items?: Array<{ id: string; due: number }>; displayName?: string }>({ prefix: 'whoff:' })
+    let earliest: number | null = null
+    let remaining = 0
+    for (const [k, v] of entries) {
+      const deviceId = k.slice(6)
+      if (this.peer(deviceId)) { await this.ctx.storage.delete(k); continue }
+      const list = v.items ?? (v.due !== undefined ? [{ id: '*', due: v.due }] : [])
+      const dueNow = list.filter(x => x.due <= now)
+      const later = list.filter(x => x.due > now)
+      if (dueNow.length) {
+        const dueSet = new Set(dueNow.map(x => x.id))
+        const ids = await this.sendWebhook(v.account, 'host_offline', { deviceId, displayName: v.displayName }, c => dueSet.has('*') ? (c.offlineDelaySec ?? 0) > 0 : dueSet.has(c.id))
+        if (ids.length) {
+          const prev = (await this.ctx.storage.get<string[]>(`whsent:${deviceId}`)) ?? []
+          await this.ctx.storage.put(`whsent:${deviceId}`, [...new Set([...prev, ...ids])])
+        }
+      }
+      if (later.length) {
+        remaining++
+        if (dueNow.length) await this.ctx.storage.put(k, { account: v.account, items: later, displayName: v.displayName })
+        const minDue = Math.min(...later.map(x => x.due))
+        if (earliest === null || minDue < earliest) earliest = minDue
+      } else if (dueNow.length || !list.length) {
+        await this.ctx.storage.delete(k)
+      }
+    }
+    this.hasPendingOffline = remaining > 0
+    return earliest
+  }
+  private async cleanupExpired(): Promise<boolean> {
+    const now = Date.now()
+    if (now - this.lastCleanupAt < 300_000) return this.hasExpiring
     this.lastCleanupAt = now
-    for (const prefix of ['qr:', 'ostate:', 'hostcode:']) {
+    let hasMore = false
+    for (const prefix of ['qr:', 'ostate:', 'oinvite:', 'hostcode:']) {
       const entries = await this.ctx.storage.list<{ exp?: number; expiresAt?: number }>({ prefix })
       const del: string[] = []
       for (const [k, v] of entries) {
         const exp = v.exp ?? v.expiresAt ?? 0
         if (exp > 0 && exp <= now) del.push(k)
+        else if (exp > now) hasMore = true
       }
-      if (del.length) await this.ctx.storage.delete(del)
+      for (let i = 0; i < del.length; i += 128) await this.ctx.storage.delete(del.slice(i, i + 128))
     }
     await this.store.cleanupExpiredSessions()
+    await this.store.cleanupExpiredTokens()
+    await this.pairing.cleanupExpired()
+    this.hasExpiring = hasMore || (await this.pairing.countActive()) > 0
+    return this.hasExpiring
   }
   private isEnvAdmin(a: string): boolean {
     return String(this.env.ADMIN_ACCOUNTS ?? '').split(',').map(normEmail).filter(Boolean).includes(normEmail(a))
@@ -641,6 +863,19 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
   private isAdminAccount(a: string): boolean {
     const e = normEmail(a)
     return this.isEnvAdmin(e) || this.admins.has(e)
+  }
+  private isRootAdmin(a: string): boolean {
+    return a === 'admin-token' || this.isEnvAdmin(a)
+  }
+  private adminPermsOf(a: string): AdminPerm[] {
+    if (this.isRootAdmin(a)) return [...ALL_ADMIN_PERMS]
+    const e = normEmail(a)
+    if (!this.admins.has(e)) return []
+    return this.adminPerms[e] ?? [...ALL_ADMIN_PERMS]
+  }
+  private requirePerm(actor: string, ...perms: AdminPerm[]): void {
+    const have = this.adminPermsOf(actor)
+    if (!perms.some(p => have.includes(p))) throw new ApiError('PERMISSION_DENIED', 403)
   }
   private async accountAuth(req: Request): Promise<string> {
     return this.store.session(this.bearer(req))
@@ -668,6 +903,7 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
     const actor = await this.adminAuth(req)
     const p = path.slice('/api/v1/admin'.length)
     if (method === 'GET' && p === '/overview') {
+      this.requirePerm(actor, 'overview')
       const devices = await this.store.listAll()
       const live = devices.filter(d => !d.revoked)
       const socks = this.sockets().filter(s => s.att.id)
@@ -681,30 +917,53 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
       })
     }
     if (p === '/settings') {
-      if (method === 'GET') return json(200, { settings: this.cfg, defaults: defaultSettings(this.env), defaultStun: defaultStunServers(), effectiveStun: resolveStunUrls(this.cfg) })
+      if (method === 'GET') {
+        this.requirePerm(actor, 'settings', 'oauth')
+        return json(200, { settings: this.cfg, defaults: defaultSettings(this.env), defaultStun: defaultStunServers(), effectiveStun: resolveStunUrls(this.cfg) })
+      }
       if (method === 'PUT') {
-        await this.applySettings(sanitize(await this.body(req) as Record<string, unknown>, this.cfg))
+        const raw = await this.body(req) as Record<string, unknown>
+        const oauthOnlyKeys = new Set(['oauthAllowedDomains', 'oauthBlockedDomains', 'devicePairingEnabled'])
+        const keys = Object.keys(raw)
+        if (keys.length && keys.every(k => oauthOnlyKeys.has(k))) this.requirePerm(actor, 'settings', 'oauth')
+        else this.requirePerm(actor, 'settings')
+        await this.applySettings(sanitize(raw, this.cfg))
         await this.log('settings.update', '', actor)
         return json(200, { settings: this.cfg, effectiveStun: resolveStunUrls(this.cfg) })
       }
     }
     if (p === '/accounts') {
+      this.requirePerm(actor, 'accounts')
       if (method === 'GET') {
         const devices = await this.store.listAll()
-        const items = await Promise.all((await this.store.listAccounts()).map(async email => {
-          const mine = devices.filter(d => d.account === email && !d.revoked)
-          return { email, devices: mine.length, online: mine.filter(d => this.peer(d.descriptor.deviceId)).length, admin: this.isAdminAccount(email), rootAdmin: this.isEnvAdmin(email) }
-        }))
-        return json(200, { items })
+        const by = new Map<string, typeof devices>()
+        for (const d of devices) if (!d.revoked) { const g = by.get(d.account); if (g) g.push(d); else by.set(d.account, [d]) }
+        const items = (await this.store.listAccountRecords()).map(acct => {
+          const mine = by.get(acct.email) ?? []
+          return {
+            email: acct.email,
+            devices: mine.length,
+            online: mine.filter(d => this.peer(d.descriptor.deviceId)).length,
+            admin: this.isAdminAccount(acct.email),
+            rootAdmin: this.isEnvAdmin(acct.email),
+            adminPerms: this.adminPermsOf(acct.email),
+            disabled: !!acct.disabled,
+            maxDevices: acct.maxDevices ?? null,
+            defaultMaxDevices: this.cfg.maxDevicesPerAccount,
+            deviceOnly: !!acct.deviceOnly,
+          }
+        })
+        return json(200, { items, viewerRootAdmin: this.isRootAdmin(actor) })
       }
       if (method === 'POST') {
         const { email, password } = loginSchema.parse(await this.body(req))
         const e = normEmail(email)
+        if (this.isAdminAccount(e) && e !== normEmail(actor) && !this.isRootAdmin(actor)) throw new ApiError('PERMISSION_DENIED', 403, '仅根管理员可修改其他管理员账号')
         await this.store.upsertAccount(e, password)
         await this.ctx.storage.delete(`oauthpw:${e}`)
         await this.log('account.upsert', e, actor)
         if (e === normEmail(actor)) {
-          const s = await this.store.createSession(e)
+          const s = await this.store.createSession(e, req.headers.get('user-agent') ?? '')
           return json(200, { status: 'ok', account: e }, { 'Set-Cookie': this.cookie(s.value, this.cfg.sessionHours * 3600, url) })
         }
         return json(200, { status: 'ok', account: e })
@@ -712,18 +971,36 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
     }
     const admRole = /^\/accounts\/([^/]+)\/admin$/.exec(p)
     if (method === 'POST' && admRole) {
+      if (!this.isRootAdmin(actor)) throw new ApiError('PERMISSION_DENIED', 403, '仅根管理员可变更管理员身份')
       const e = normEmail(decodeURIComponent(admRole[1]!))
       const { admin } = z.object({ admin: z.boolean() }).parse(await this.body(req))
-      if (this.isEnvAdmin(e) && !admin) throw new ApiError('INVALID_MESSAGE', 400)
+      if (this.isEnvAdmin(e) && !admin) throw new ApiError('INVALID_MESSAGE', 400, '不能取消根管理员权限')
       if (admin) this.admins.add(e)
-      else this.admins.delete(e)
+      else {
+        this.admins.delete(e)
+        if (this.adminPerms[e]) { delete this.adminPerms[e]; await this.ctx.storage.put('admin_perms', this.adminPerms) }
+      }
       await this.ctx.storage.put('admins', [...this.admins])
       await this.log('account.admin', `${e} -> ${admin}`, actor)
       return json(200, { status: 'ok', admin: this.isAdminAccount(e) })
     }
+    const admPerms = /^\/accounts\/([^/]+)\/perms$/.exec(p)
+    if (method === 'POST' && admPerms) {
+      if (!this.isRootAdmin(actor)) throw new ApiError('PERMISSION_DENIED', 403, '仅根管理员可配置管理员权限')
+      const e = normEmail(decodeURIComponent(admPerms[1]!))
+      if (!this.isAdminAccount(e)) throw new ApiError('INVALID_MESSAGE', 400, '该账号不是管理员')
+      if (this.isEnvAdmin(e)) throw new ApiError('INVALID_MESSAGE', 400, '根管理员拥有全部权限，无需配置')
+      const { perms } = z.object({ perms: z.array(z.enum(ALL_ADMIN_PERMS)).max(ALL_ADMIN_PERMS.length) }).parse(await this.body(req))
+      this.adminPerms[e] = [...new Set(perms)]
+      await this.ctx.storage.put('admin_perms', this.adminPerms)
+      await this.log('account.perms', `${e} -> ${this.adminPerms[e]!.join(',') || 'none'}`, actor)
+      return json(200, { status: 'ok', adminPerms: this.adminPerms[e] })
+    }
     const acctMeta = /^\/accounts\/([^/]+)\/meta$/.exec(p)
     if (method === 'POST' && acctMeta) {
+      this.requirePerm(actor, 'accounts')
       const e = normEmail(decodeURIComponent(acctMeta[1]!))
+      if (this.isAdminAccount(e) && !this.isRootAdmin(actor)) throw new ApiError('PERMISSION_DENIED', 403, '仅根管理员可修改管理员账号状态')
       const b = z.object({ disabled: z.boolean().optional(), maxDevices: z.number().int().min(0).max(4096).nullable().optional() }).parse(await this.body(req))
       await this.store.setAccountMeta(e, b)
       if (b.disabled) for (const d of await this.store.list(e, true)) await this.disconnect(d.descriptor.deviceId, 'AUTH_INVALID')
@@ -731,6 +1008,7 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
       return json(200, { status: 'ok' })
     }
     if (p === '/invites') {
+      this.requirePerm(actor, 'invites')
       if (method === 'GET') {
         const all = await this.ctx.storage.list<{ code: string; maxUses: number; uses: number; expiresAt: number; note?: string; createdAt: number }>({ prefix: 'invite:' })
         return json(200, { items: [...all.values()].sort((a, b) => b.createdAt - a.createdAt) })
@@ -757,24 +1035,25 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
       }
     }
     if (method === 'POST' && p === '/invites/batch-delete') {
+      this.requirePerm(actor, 'invites')
       const b = z.object({ codes: z.array(z.string()).max(200).optional(), expired: z.boolean().optional() }).parse(await this.body(req))
       let removed = 0
       if (b.expired) {
         const now = Date.now()
         const all = await this.ctx.storage.list<{ code: string; maxUses: number; uses: number; expiresAt: number }>({ prefix: 'invite:' })
         const keys = [...all].filter(([, v]) => (v.expiresAt > 0 && v.expiresAt <= now) || v.uses >= v.maxUses).map(([k]) => k)
-        if (keys.length) { await this.ctx.storage.delete(keys); removed += keys.length }
+        for (let i = 0; i < keys.length; i += 128) removed += await this.ctx.storage.delete(keys.slice(i, i + 128))
       }
       if (b.codes?.length) {
-        const keys = b.codes.map(c => `invite:${c.toUpperCase()}`)
-        await this.ctx.storage.delete(keys)
-        removed += keys.length
+        const keys = [...new Set(b.codes.map(c => `invite:${c.toUpperCase()}`))]
+        for (let i = 0; i < keys.length; i += 128) removed += await this.ctx.storage.delete(keys.slice(i, i + 128))
       }
       await this.log('invite.batch_delete', `${removed}`, actor)
       return json(200, { status: 'deleted', removed })
     }
     const invDel = /^\/invites\/([A-Za-z0-9_-]{4,32})$/.exec(p)
     if (method === 'DELETE' && invDel) {
+      this.requirePerm(actor, 'invites')
       const code = invDel[1]!.toUpperCase()
       await this.ctx.storage.delete(`invite:${code}`)
       await this.log('invite.delete', code, actor)
@@ -782,21 +1061,34 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
     }
     const del = /^\/accounts\/([^/]+)$/.exec(p)
     if (method === 'DELETE' && del) {
+      this.requirePerm(actor, 'accounts')
       const e = normEmail(decodeURIComponent(del[1]!))
-      for (const d of await this.store.list(e, true)) await this.disconnect(d.descriptor.deviceId, 'AUTH_INVALID')
+      if (this.isAdminAccount(e) && !this.isRootAdmin(actor)) throw new ApiError('PERMISSION_DENIED', 403, '仅根管理员可删除管理员账号')
+      const devs = await this.store.list(e, true)
+      for (const d of devs) await this.disconnect(d.descriptor.deviceId, 'AUTH_INVALID')
       await this.store.deleteAccount(e)
+      if (this.admins.delete(e)) await this.ctx.storage.put('admins', [...this.admins])
+      if (this.adminPerms[e]) { delete this.adminPerms[e]; await this.ctx.storage.put('admin_perms', this.adminPerms) }
+      await this.ctx.storage.delete([`webhooks:${e}`, `webhook:${e}`, `whlog:${e}`, `oauthpw:${e}`])
+      const whKeys = devs.flatMap(d => [`whoff:${d.descriptor.deviceId}`, `whsent:${d.descriptor.deviceId}`])
+      for (let i = 0; i < whKeys.length; i += 128) await this.ctx.storage.delete(whKeys.slice(i, i + 128))
+      const hcKeys: string[] = []
+      for (const [k, v] of await this.ctx.storage.list<{ account: string }>({ prefix: 'hostcode:' })) if (v.account === e) hcKeys.push(k)
+      for (let i = 0; i < hcKeys.length; i += 128) await this.ctx.storage.delete(hcKeys.slice(i, i + 128))
       await this.log('account.delete', e, actor)
       return json(200, { status: 'deleted' })
     }
     if (method === 'GET' && p === '/devices') {
+      this.requirePerm(actor, 'devices')
       const items = await Promise.all((await this.store.listAll()).filter(d => !d.revoked).map(async d => {
         const { identityKey: _k, ...rest } = await this.describe(d)
-        return { ...rest, account: d.account }
+        return { ...rest, account: d.account, pairingRestricted: !!d.pairingRestricted }
       }))
       return json(200, { items })
     }
     const dev = /^\/devices\/([^/]+)\/(disconnect|revoke)$/.exec(p)
     if (method === 'POST' && dev) {
+      this.requirePerm(actor, 'devices')
       const id = decodeURIComponent(dev[1]!)
       if (dev[2] === 'revoke') await this.store.revoke(id)
       else await this.disconnect(id, 'CONNECTION_FAILED')
@@ -804,9 +1096,19 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
       return json(200, { status: 'ok' })
     }
     if (p === '/oauth') {
+      this.requirePerm(actor, 'oauth')
       if (method === 'GET') {
         const ov = await this.oauthOverrides()
-        return json(200, { items: loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).map(x => ({ id: x.id, displayName: x.displayName, enabled: ov[x.id]?.enabled ?? x.enabled, allowRegister: ov[x.id]?.allowRegister ?? x.allowRegister, requireInviteCode: (ov[x.id] as { requireInviteCode?: boolean } | undefined)?.requireInviteCode ?? true, callbackUrl: `${url.origin}/api/v1/auth/oauth/${x.id}/callback`, clientId: x.clientId, source: this.oauthCustom[x.id] ? 'dashboard' : 'env' })) })
+        return json(200, {
+          devicePairing: {
+            enabled: this.cfg.devicePairingEnabled,
+            protocol: DEVICE_PAIRING_PROTOCOL,
+            qrFormat: DEVICE_PAIRING_QR_FORMAT,
+            serverPublicKey: await this.pairing.getServerPublicKey(),
+            activeSessions: await this.pairing.countActive(),
+          },
+          items: loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).map(x => ({ id: x.id, displayName: x.displayName, enabled: ov[x.id]?.enabled ?? x.enabled, allowRegister: ov[x.id]?.allowRegister ?? x.allowRegister, requireInviteCode: (ov[x.id] as { requireInviteCode?: boolean } | undefined)?.requireInviteCode ?? true, callbackUrl: `${url.origin}/api/v1/auth/oauth/${x.id}/callback`, clientId: x.clientId, source: this.oauthCustom[x.id] ? 'dashboard' : 'env', ...(this.oauthCustom[x.id] ? { authUrl: this.oauthCustom[x.id]!.authUrl ?? '', tokenUrl: this.oauthCustom[x.id]!.tokenUrl ?? '', userInfoUrl: this.oauthCustom[x.id]!.userInfoUrl ?? '', scopes: this.oauthCustom[x.id]!.scopes ?? '' } : {}) })),
+        })
       }
       if (method === 'POST') {
         const b = z.object({
@@ -823,7 +1125,7 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
         }).parse(await this.body(req))
         const prev = loadProviders(this.env.OAUTH_PROVIDERS, this.oauthCustom).find(x => x.id === b.id)
         const sec = b.clientSecret || this.oauthCustom[b.id]?.clientSecret || prev?.clientSecret
-        if (!sec || sec.length < 4) throw new ApiError('INVALID_MESSAGE')
+        if (!sec || sec.length < 4) throw new ApiError('INVALID_MESSAGE', 400, 'Client Secret 至少需要 4 个字符')
         this.oauthCustom[b.id] = {
           enabled: b.enabled ?? prev?.enabled ?? true, allowRegister: b.allowRegister ?? prev?.allowRegister ?? true,
           ...(b.displayName ? { displayName: b.displayName } : {}),
@@ -840,6 +1142,7 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
     }
     const oaAdm = /^\/oauth\/([a-z0-9_-]+)$/.exec(p)
     if (oaAdm) {
+      this.requirePerm(actor, 'oauth')
       if (method === 'DELETE') {
         delete this.oauthCustom[oaAdm[1]!]
         await this.ctx.storage.put('oauth_custom', this.oauthCustom)
@@ -857,26 +1160,31 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
       }
     }
     if (method === 'GET' && p === '/links') {
+      this.requirePerm(actor, 'links')
       const now = Date.now()
       return json(200, { items: Object.values(this.links).map(l => ({ ...l, ageMs: now - l.created })) })
     }
     const lk = /^\/links\/([^/]+)$/.exec(p)
     if (method === 'DELETE' && lk) {
+      this.requirePerm(actor, 'links')
       const l = this.links[lk[1]!]
       if (l) { this.drop(l, 'CONNECTION_FAILED'); await this.log('link.drop', l.id, actor) }
       return json(200, { status: 'ok' })
     }
     if (p === '/events') {
+      this.requirePerm(actor, 'events')
       if (method === 'GET') return json(200, { items: this.events })
       if (method === 'DELETE') { this.events = []; await this.ctx.storage.delete('events'); return json(200, { status: 'ok' }) }
     }
 
     // ---- TURN management (Cloudflare Realtime TURN API) ----
     if (p === '/turn') {
+      this.requirePerm(actor, 'turn')
       if (method === 'GET') return json(200, { configured: this.turn !== undefined, keyId: this.turn?.keyId ?? null, source: (await this.ctx.storage.get('turn')) ? 'dashboard' : this.turn ? 'env' : null, enabled: this.cfg.turnEnabled })
       if (method === 'DELETE') { await this.ctx.storage.delete('turn'); this.turn = this.env.TURN_KEY_ID && this.env.TURN_KEY_API_TOKEN ? { keyId: String(this.env.TURN_KEY_ID).trim(), apiToken: String(this.env.TURN_KEY_API_TOKEN).trim() } : undefined; clearIceCache(); await this.log('turn.clear', '', actor); return json(200, { status: 'ok' }) }
     }
     if (method === 'POST' && p === '/turn/manual') {
+      this.requirePerm(actor, 'turn')
       const b = z.object({ keyId: z.string().trim().min(8).max(64), apiToken: z.string().trim().min(8).max(256) }).parse(await this.body(req))
       this.turn = { keyId: b.keyId, apiToken: b.apiToken }
       await this.ctx.storage.put('turn', this.turn)
@@ -885,6 +1193,7 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
       return json(200, { status: 'ok', keyId: b.keyId })
     }
     if (method === 'POST' && p === '/turn/provision') {
+      this.requirePerm(actor, 'turn')
       const b = z.object({ accountId: z.string().trim().regex(/^[a-f0-9]{32}$/), apiToken: z.string().trim().max(256).optional(), email: z.string().max(254).optional(), apiKey: z.string().max(256).optional(), name: z.string().trim().max(64).optional() }).parse(await this.body(req))
       const auth: CfAuth = { apiToken: b.apiToken, email: b.email, apiKey: b.apiKey }
       if (!auth.apiToken && !(auth.email && auth.apiKey)) throw new ApiError('INVALID_MESSAGE')
@@ -895,14 +1204,16 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
         clearIceCache()
         await this.log('turn.provision', key.keyId, actor)
         return json(200, { status: 'ok', keyId: key.keyId })
-      } catch (e) { return json(502, { error: { code: 'CLOUDFLARE_API_ERROR', message: String(e instanceof Error ? e.message : e).slice(0, 300), retryable: false } }) }
+      } catch (e) { throw new ApiError('CLOUDFLARE_API_ERROR', 502, String(e instanceof Error ? e.message : e).slice(0, 300)) }
     }
     if (method === 'POST' && p === '/turn/list') {
+      this.requirePerm(actor, 'turn')
       const b = z.object({ accountId: z.string().trim().regex(/^[a-f0-9]{32}$/), apiToken: z.string().trim().max(256).optional(), email: z.string().max(254).optional(), apiKey: z.string().max(256).optional() }).parse(await this.body(req))
       try { return json(200, { items: await listTurnKeys({ apiToken: b.apiToken, email: b.email, apiKey: b.apiKey }, b.accountId) }) }
-      catch (e) { return json(502, { error: { code: 'CLOUDFLARE_API_ERROR', message: String(e instanceof Error ? e.message : e).slice(0, 300), retryable: false } }) }
+      catch (e) { throw new ApiError('CLOUDFLARE_API_ERROR', 502, String(e instanceof Error ? e.message : e).slice(0, 300)) }
     }
     if (method === 'POST' && p === '/turn/test') {
+      this.requirePerm(actor, 'turn')
       const r = await fetchIceServers(this.turnOn ? this.turn : undefined, this.cfg.turnTtlSeconds, resolveStunUrls(this.cfg), true)
       return json(200, { turn: r.turn, error: r.error ?? null, servers: r.servers.map(s => ({ urls: s.urls, hasCredential: Boolean(s.credential) })) })
     }
@@ -959,13 +1270,21 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
         if (ws.deserializeAttachment() === null || (ws.deserializeAttachment() as Att).id) return
         await this.disconnect(d.deviceId, 'CONNECTION_REPLACED')
         const caps = this.negotiated(p.capabilities)
-        this.setAtt(ws, { id: d.deviceId, account: device.account, role: d.role, caps, version: p.clientVersion ?? d.clientVersion ?? '', lastPong: Date.now(), created: att.created })
+        this.setAtt(ws, { id: d.deviceId, account: device.account, role: d.role, caps, version: p.clientVersion ?? d.clientVersion ?? '', lastPong: Date.now(), lastPingAt: Date.now(), created: att.created })
         await this.store.touch(d.deviceId, p.clientVersion, p.harnessVersion)
         this.send(ws, createControlFrame('hello.ack', {
           protocol: 1, serverVersion: 'worker/0.1.0', connectionSessionId: crypto.randomUUID(),
           heartbeatIntervalMs: this.cfg.heartbeatMs, maxControlFrameBytes: MAX_CONTROL_FRAME_BYTES, maxRelayFrameBytes: MAX_RELAY_FRAME_BYTES,
           capabilities: caps, webrtcEnabled: true, webrtcFallbackTimeoutMs: WEBRTC_FALLBACK_TIMEOUT_MS,
         }))
+        if (d.role === 'host') this.ctx.waitUntil((async () => {
+          await this.ctx.storage.delete(`whoff:${d.deviceId}`)
+          const sentIds = await this.ctx.storage.get<string[] | number>(`whsent:${d.deviceId}`)
+          if (sentIds) {
+            await this.ctx.storage.delete(`whsent:${d.deviceId}`)
+            await this.sendWebhook(device.account, 'host_online', { deviceId: d.deviceId, displayName: d.name }, Array.isArray(sentIds) ? c => sentIds.includes(c.id) : undefined)
+          }
+        })())
         await this.ensureAlarm(this.cfg.heartbeatMs)
         return
       }
@@ -996,7 +1315,7 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
     if (this.sockets().some(s => s.ws !== ws && s.att.id === att.id)) return // replaced
     this.peerCache?.delete(att.id)
     for (const link of Object.values(this.links)) if (link.host === att.id || link.client === att.id) this.drop(link, 'CONNECTION_FAILED')
-    if (att.role === 'host' && att.account) this.ctx.waitUntil(this.sendWebhook(att.account, 'host_offline', { deviceId: att.id }))
+    if (att.role === 'host' && att.account) this.ctx.waitUntil(this.onHostDisconnect(att.account, att.id))
   }
   async webSocketError(ws: WebSocket): Promise<void> { await this.webSocketClose(ws, 1011) }
 
@@ -1012,14 +1331,20 @@ a.btn{display:block;width:100%;padding:10px 16px;border-radius:10px;background:l
         continue
       }
       if (now - att.lastPong > this.cfg.heartbeatDisconnectMs) { await this.disconnect(att.id, 'CONNECTION_FAILED'); continue }
-      const nonce = crypto.randomUUID()
-      this.setAtt(ws, { ...att, nonce })
-      this.send(ws, createControlFrame('ping', { nonce }))
+      if (now - (att.lastPingAt ?? 0) >= this.cfg.heartbeatMs) {
+        const nonce = crypto.randomUUID()
+        this.setAtt(ws, { ...att, nonce, lastPingAt: now })
+        this.send(ws, createControlFrame('ping', { nonce }))
+      }
     }
     for (const link of Object.values(this.links)) if (link.stage !== 'ready' && now - link.created > 30_000) this.drop(link, 'CONNECTION_FAILED')
     for (const [k, v] of this.dropped) if (v.expiresAt <= now) this.dropped.delete(k)
-    await this.cleanupExpired()
-    if (this.ctx.getWebSockets().length > 0) await this.ctx.storage.setAlarm(now + (waitingHello ? this.cfg.helloTimeoutMs : this.cfg.heartbeatMs))
+    const nextWh = await this.processPendingOffline(now)
+    const moreExp = await this.cleanupExpired()
+    const nextWs = this.ctx.getWebSockets().length > 0 ? now + (waitingHello ? this.cfg.helloTimeoutMs : this.cfg.heartbeatMs) : null
+    const nextClean = moreExp ? Math.max(now + 10_000, this.lastCleanupAt + 300_000) : null
+    const cands = [nextWs, nextWh, nextClean].filter((x): x is number => x !== null)
+    if (cands.length) await this.ctx.storage.setAlarm(Math.min(...cands))
   }
 
   // ---------------- frame handling (port of gateway.ts) ----------------

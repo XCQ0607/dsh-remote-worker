@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-worker",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Self-hosted ds-harness-remote relay & signaling server on Cloudflare Workers + Durable Objects (SQLite & Hibernation WebSocket) with Realtime TURN and Web Admin UI.",
   "license": "Apache-2.0",
   "private": true,

@@ -3,11 +3,11 @@ import { z } from 'zod'
 import { equal, hash, hmacB64url, pbkdf2, secret } from './crypto.js'
 
 export class ApiError extends Error {
-  constructor(readonly code: string, readonly status = 400) { super(code) }
+  constructor(readonly code: string, readonly status = 400, readonly detail?: string) { super(detail || code) }
 }
 
-export interface AccountRecord { email: string; salt: string; verifier: string; disabled?: boolean; maxDevices?: number }
-export interface SavedDevice { account: string; descriptor: AccountDeviceDescriptor; revoked: boolean; lastSeenAt: number }
+export interface AccountRecord { email: string; salt: string; verifier: string; disabled?: boolean; maxDevices?: number; deviceOnly?: boolean }
+export interface SavedDevice { account: string; descriptor: AccountDeviceDescriptor; revoked: boolean; lastSeenAt: number; pairingRestricted?: boolean }
 interface SavedToken {
   kind: 'access' | 'refresh'; deviceId: string; expires: number; used: boolean
   recovery?: { nonce: string; accessExpires: number }
@@ -31,6 +31,7 @@ export class Store {
   private acctCache = new Map<string, AccountRecord>()
   private allAcctsLoaded = false
   private sesCache = new Map<string, SavedSession>()
+  private regLocks = new Map<string, Promise<unknown>>()
   constructor(private s: DurableObjectStorage) {}
 
   // ---- accounts ----
@@ -52,10 +53,15 @@ export class Store {
     await this.ensureAccounts()
     return [...this.acctCache.keys()]
   }
+  async listAccountRecords(): Promise<AccountRecord[]> {
+    await this.ensureAccounts()
+    return [...this.acctCache.values()]
+  }
   async upsertAccount(email: string, password: string): Promise<void> {
     const e = normEmail(email)
     if (!e || e.length > 254 || password.length < 12 || password.length > 1024) throw new ApiError('INVALID_MESSAGE')
     const prev = await this.getAccount(e)
+    if (prev?.deviceOnly) throw new ApiError('INVALID_MESSAGE', 400, '纯设备配对账号不支持设置登录密码')
     const salt = secret()
     const rec: AccountRecord = { email: e, salt, verifier: await pbkdf2(password, salt), disabled: prev?.disabled, maxDevices: prev?.maxDevices }
     await this.s.put(`acct:${e}`, rec)
@@ -81,12 +87,40 @@ export class Store {
     this.acctCache.delete(e)
     await this.s.delete(`acct:${e}`)
     await this.deleteSessions(e)
-    for (const d of await this.list(e, true)) await this.revokeRaw(d.descriptor.deviceId)
+    const devs = await this.list(e, true)
+    if (!devs.length) return
+    const ids = devs.map(d => d.descriptor.deviceId)
+    const tokKeys: string[] = []
+    for (let i = 0; i < ids.length; i += 128) {
+      const m = await this.s.get<string[]>(ids.slice(i, i + 128).map(id => `devtok:${id}`))
+      for (const v of m.values()) if (v?.length) tokKeys.push(...v)
+    }
+    const whKeys: string[] = []
+    const devWrites: Record<string, SavedDevice> = {}
+    for (const d of devs) {
+      const id = d.descriptor.deviceId
+      const upd: SavedDevice = { ...d, revoked: true }
+      this.devCache.set(id, upd)
+      devWrites[`dev:${id}`] = upd
+      whKeys.push(`whoff:${id}`, `whsent:${id}`, `devtok:${id}`)
+      this.onInvalidate(id)
+    }
+    await this.putEntries(devWrites)
+    await this.delKeys([...whKeys, ...tokKeys])
+  }
+  async upsertDeviceOnlyAccount(account: string): Promise<AccountRecord> {
+    const e = normEmail(account)
+    const prev = await this.getAccount(e)
+    if (prev) return prev
+    const rec: AccountRecord = { email: e, salt: '', verifier: '', deviceOnly: true }
+    await this.s.put(`acct:${e}`, rec)
+    this.acctCache.set(e, rec)
+    return rec
   }
   async verifyLogin(email: string, password: string): Promise<string> {
     const acct = await this.getAccount(email)
-    const verifier = await pbkdf2(password, acct?.salt ?? 'x'.repeat(43)) // dummy work when unknown
-    if (!acct || !(await equal(verifier, acct.verifier))) throw new ApiError('AUTH_INVALID', 401)
+    const verifier = await pbkdf2(password, acct?.salt || 'x'.repeat(43)) // dummy work when unknown
+    if (!acct || acct.deviceOnly || !acct.verifier || !(await equal(verifier, acct.verifier))) throw new ApiError('AUTH_INVALID', 401)
     if (acct.disabled) throw new ApiError('ACCOUNT_DISABLED', 403)
     return acct.email
   }
@@ -100,15 +134,28 @@ export class Store {
     await this.s.put(key, ses)
     return { value, expiresAt }
   }
-  async listSessions(account: string): Promise<Array<{ id: string; ua: string; created: number; expires: number }>> {
+  async listSessions(account: string, currentId?: string): Promise<Array<{ id: string; ua: string; created: number; expires: number; current: boolean }>> {
     const now = Date.now()
     const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
-    const out: Array<{ id: string; ua: string; created: number; expires: number }> = []
+    const out: Array<{ id: string; ua: string; created: number; expires: number; current: boolean }> = []
+    const expired: string[] = []
     for (const [k, v] of all) {
-      if (v.expires <= now) { this.sesCache.delete(k); await this.s.delete(k); continue }
-      if (v.account === account) out.push({ id: v.id ?? k.slice(4, 16), ua: v.ua ?? '', created: v.created ?? 0, expires: v.expires })
+      if (v.expires <= now) { this.sesCache.delete(k); expired.push(k); continue }
+      const id = v.id ?? k.slice(4, 16)
+      if (v.account === account) out.push({ id, ua: v.ua ?? '', created: v.created ?? 0, expires: v.expires, current: !!currentId && id === currentId })
     }
-    return out.sort((a, b) => b.created - a.created)
+    await this.delKeys(expired)
+    return out.sort((a, b) => Number(b.current) - Number(a.current) || b.created - a.created)
+  }
+  async deleteOtherSessions(account: string, keepId: string): Promise<number> {
+    const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
+    const del: string[] = []
+    for (const [k, v] of all) {
+      const id = v.id ?? k.slice(4, 16)
+      if (v.account === account && id !== keepId) { this.sesCache.delete(k); del.push(k) }
+    }
+    for (let i = 0; i < del.length; i += 128) await this.s.delete(del.slice(i, i + 128))
+    return del.length
   }
   async deleteSessionById(account: string, id: string): Promise<boolean> {
     const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
@@ -121,15 +168,22 @@ export class Store {
     }
     return false
   }
+  private async delKeys(keys: string[]): Promise<void> {
+    for (let i = 0; i < keys.length; i += 128) await this.s.delete(keys.slice(i, i + 128))
+  }
+  private async putEntries(entries: Record<string, unknown>): Promise<void> {
+    const kv = Object.entries(entries)
+    for (let i = 0; i < kv.length; i += 128) await this.s.put(Object.fromEntries(kv.slice(i, i + 128)))
+  }
   async cleanupExpiredSessions(): Promise<number> {
     const now = Date.now()
     const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
     const expired = [...all].filter(([, v]) => v.expires <= now).map(([k]) => k)
     for (const k of expired) this.sesCache.delete(k)
-    if (expired.length) await this.s.delete(expired)
+    await this.delKeys(expired)
     return expired.length
   }
-  async session(token: string): Promise<string> {
+  async sessionInfo(token: string): Promise<{ account: string; id: string }> {
     const key = `ses:${await hash(token)}`
     let v = this.sesCache.get(key)
     if (!v) {
@@ -137,7 +191,11 @@ export class Store {
       if (v) this.sesCache.set(key, v)
     }
     if (!v || v.expires <= Date.now()) { this.sesCache.delete(key); if (v) await this.s.delete(key); throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401) }
-    return v.account
+    if ((await this.getAccount(v.account))?.disabled) throw new ApiError('ACCOUNT_DISABLED', 403)
+    return { account: v.account, id: v.id ?? key.slice(4, 16) }
+  }
+  async session(token: string): Promise<string> {
+    return (await this.sessionInfo(token)).account
   }
   async deleteSession(token: string): Promise<void> {
     const key = `ses:${await hash(token)}`
@@ -148,7 +206,7 @@ export class Store {
     const all = await this.s.list<SavedSession>({ prefix: 'ses:' })
     const keys = [...all].filter(([, v]) => v.account === account).map(([k]) => k)
     for (const k of keys) this.sesCache.delete(k)
-    if (keys.length) await this.s.delete(keys)
+    await this.delKeys(keys)
   }
 
   // ---- devices ----
@@ -175,13 +233,28 @@ export class Store {
     await this.ensureDevices()
     return [...this.devCache.values()].filter(d => d.account === account && (includeRevoked || !d.revoked))
   }
-  async register(account: string, raw: AccountDeviceDescriptor) {
+  async register(account: string, raw: AccountDeviceDescriptor, opts?: { pairingRestricted?: boolean }) {
+    const prev = this.regLocks.get(account) ?? Promise.resolve()
+    const run = prev.catch(() => {}).then(() => this.registerSerial(account, raw, opts))
+    this.regLocks.set(account, run)
+    try { return await run } finally { if (this.regLocks.get(account) === run) this.regLocks.delete(account) }
+  }
+  private async registerSerial(account: string, raw: AccountDeviceDescriptor, opts?: { pairingRestricted?: boolean }) {
     const descriptor = accountDeviceDescriptorSchema.parse(raw)
     const old = await this.s.get<SavedDevice>(`dev:${descriptor.deviceId}`)
     if (old?.revoked) throw new ApiError('DEVICE_REVOKED', 403)
     if (old && (old.account !== account || old.descriptor.identityKey !== descriptor.identityKey || old.descriptor.role !== descriptor.role)) throw new ApiError('PEER_IDENTITY_MISMATCH', 409)
-    if (!old && (await this.list(account)).length >= this.maxDevices) throw new ApiError('RATE_LIMITED', 429)
-    const rec: SavedDevice = { account, descriptor, revoked: false, lastSeenAt: old?.lastSeenAt ?? 0 }
+    const acct = await this.getAccount(account)
+    if (acct?.disabled) throw new ApiError('ACCOUNT_DISABLED', 403)
+    const acctMax = acct?.maxDevices ?? this.maxDevices
+    if (!old && (await this.list(account)).length >= acctMax) throw new ApiError('RATE_LIMITED', 429, `设备数量已达账号配额上限 (${acctMax} 台)`)
+    const rec: SavedDevice = {
+      account,
+      descriptor,
+      revoked: false,
+      lastSeenAt: old?.lastSeenAt ?? 0,
+      ...(opts?.pairingRestricted !== undefined ? { pairingRestricted: opts.pairingRestricted } : old?.pairingRestricted ? { pairingRestricted: true } : {}),
+    }
     await this.s.put(`dev:${descriptor.deviceId}`, rec)
     this.devCache.set(descriptor.deviceId, rec)
     await this.invalidate(descriptor.deviceId)
@@ -191,10 +264,6 @@ export class Store {
   // ---- tokens ----
   private async issue(deviceId: string, refreshTokenExpiresAt = Date.now() + 30 * 86400_000, previous?: { token: string; record: SavedToken }) {
     const now = Date.now()
-    const all = await this.s.list<SavedToken>({ prefix: 'tok:' })
-    const expired = [...all].filter(([, v]) => v.expires <= now).map(([k]) => k)
-    if (expired.length) await this.s.delete(expired.slice(0, 128))
-    if (all.size - expired.length + 2 > 16384) throw new ApiError('RATE_LIMITED', 429)
     const accessTokenExpiresAt = now + 60 * 60_000
     const nonce = secret()
     const { accessToken, refreshToken } = previous ? await successor(previous.token, nonce, deviceId) : { accessToken: secret(), refreshToken: secret() }
@@ -202,18 +271,24 @@ export class Store {
       [`tok:${await hash(accessToken)}`]: { kind: 'access', deviceId, expires: accessTokenExpiresAt, used: false },
       [`tok:${await hash(refreshToken)}`]: { kind: 'refresh', deviceId, expires: refreshTokenExpiresAt, used: false },
     }
+    const prevIdx = (await this.s.get<string[]>(`devtok:${deviceId}`)) ?? []
+    const newKeys = Object.keys(writes)
+    writes[`devtok:${deviceId}`] = [...new Set([...prevIdx, ...newKeys])].slice(-16) as unknown as SavedToken
     if (previous) writes[`tok:${await hash(previous.token)}`] = { ...previous.record, used: true, recovery: { nonce, accessExpires: accessTokenExpiresAt } }
-    await this.s.put(writes) // one atomic batch: consume + successor
+    await this.s.put(writes) // one atomic batch: consume + successor + device token index
     return { accessToken, refreshToken, accessTokenExpiresAt, refreshTokenExpiresAt }
   }
   async authenticate(token: string): Promise<SavedDevice> {
     const r = await this.s.get<SavedToken>(`tok:${await hash(token)}`)
     if (!r || r.kind !== 'access') throw new ApiError('AUTH_INVALID', 401)
     if (r.expires <= Date.now()) throw new ApiError('TOKEN_EXPIRED', 401)
-    return this.get(r.deviceId)
+    const dev = await this.get(r.deviceId)
+    if ((await this.getAccount(dev.account))?.disabled) throw new ApiError('ACCOUNT_DISABLED', 403)
+    return dev
   }
   async refresh(deviceId: string, token: string) {
-    await this.get(deviceId)
+    const dev = await this.get(deviceId)
+    if ((await this.getAccount(dev.account))?.disabled) throw new ApiError('ACCOUNT_DISABLED', 403)
     const record = await this.s.get<SavedToken>(`tok:${await hash(token)}`)
     if (!record || record.kind !== 'refresh' || record.deviceId !== deviceId) throw new ApiError('AUTH_INVALID', 401)
     if (record.expires <= Date.now()) throw new ApiError('TOKEN_EXPIRED', 401)
@@ -225,15 +300,26 @@ export class Store {
     if (next.used) throw new ApiError('AUTH_INVALID', 401)
     return { ...pair, accessTokenExpiresAt: record.recovery.accessExpires, refreshTokenExpiresAt: next.expires }
   }
-  async invalidate(deviceId: string): Promise<void> {
+  async cleanupExpiredTokens(): Promise<number> {
+    const now = Date.now()
     const all = await this.s.list<SavedToken>({ prefix: 'tok:' })
-    const keys = [...all].filter(([, v]) => v.deviceId === deviceId).map(([k]) => k)
-    for (let i = 0; i < keys.length; i += 128) await this.s.delete(keys.slice(i, i + 128))
+    const expired = [...all].filter(([, v]) => v.expires <= now).map(([k]) => k)
+    await this.delKeys(expired)
+    return expired.length
+  }
+  async invalidate(deviceId: string): Promise<void> {
+    const idx = await this.s.get<string[]>(`devtok:${deviceId}`)
+    if (idx?.length) await this.delKeys([...idx, `devtok:${deviceId}`])
+    else {
+      const all = await this.s.list<SavedToken>({ prefix: 'tok:' })
+      await this.delKeys([...all].filter(([, v]) => v.deviceId === deviceId).map(([k]) => k))
+    }
     this.onInvalidate(deviceId)
   }
   private async revokeRaw(id: string): Promise<void> {
     const d = await this.s.get<SavedDevice>(`dev:${id}`)
     if (d) { d.revoked = true; this.devCache.set(id, d); await this.s.put(`dev:${id}`, d) }
+    await this.s.delete([`whoff:${id}`, `whsent:${id}`])
     await this.invalidate(id)
   }
   async revoke(id: string): Promise<void> { await this.get(id); await this.revokeRaw(id) }

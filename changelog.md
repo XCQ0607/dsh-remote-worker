@@ -4,6 +4,44 @@
 
 格式约定：版本标题固定为 `## v<版本号> (<YYYY-MM-DD>)`，下一行起用 `###` 分类（新增 / 修复 / 优化 / 文档），条目用 `- ` 列表。
 
+## v1.0.2 (2026-11-18)
+
+全栈功能重构与权限安全升级：新增根管理员对普通管理员的细粒度模块授权（RBAC）、独立重构多平台 Webhook 告警系统（支持离线防抖与上线恢复）、补全主机匹配码与 DSH Go 扫码配对防并发机制、全系统错误码与审计日志中文化，并全面重塑桌面与移动端卡片界面。
+
+### 新增
+
+- **根管理员与普通管理员模块权限隔离（RBAC）**：
+  - 根管理员（`ADMIN_ACCOUNTS` / `ADMIN_TOKEN`）可在「账号管理」为普通管理员按 9 个管理模块（概览、全部设备、账号管理、实时连接、TURN 中转、系统设置、OAuth 登录、邀请码、审计日志）逐项授权或一键套用预设（运维监控 / 用户与邀请）。
+  - 所有 `/api/v1/admin/*` 接口强制校验 `requirePerm()`，前端导航仅展示已授权模块；仅根管理员可任免管理员、配置模块权限或管理其他管理员账号。
+- **Webhook 告警系统 v2（`worker/src/webhook.ts`、`web/src/components/webhooks.tsx`）**：
+  - 支持飞书 / Lark、钉钉、企业微信、Discord、Slack 与通用地址，支持飞书/钉钉加签密钥、通用 `X-DSH-Signature`（HMAC-SHA256）及编辑时清除密钥。
+  - 新增 `host_online`（主机上线恢复）事件与 `offlineDelaySec`（0–300 秒离线防抖延迟）；基于 `whsent:<deviceId>` 按 Webhook ID 精准恢复通知，补全 `device_registered` 新设备接入触发。
+  - 独立弹窗表单管理，支持按设备 ID 过滤、失败自动重试（最多 2 次）、平台业务错误码识别与最近 50 条投递日志查看/清空。
+- **主机匹配码兑换与账号策略管理**：
+  - 新增 `POST /api/v1/devices/register-by-code`，支持主机端凭 `XXXX-XXXX` 一次性匹配码直接注册绑定；单账号同时有效匹配码后端限制为 5 个。
+  - 「账号管理」支持为单个账号设置设备数量上限（`maxDevices`）与封禁开关（`disabled`），「个人中心」支持识别「当前会话」并一键「下线其他会话」。
+- **审计日志全中文展示**：
+  - 「审计日志」22 类事件类型、筛选标签、操作详情与 JSON/CSV 导出全部汉化，保留原值复制与中英文搜索。
+
+### 修复
+
+- **全链路安全与封禁拦截**：修复禁用账号（`disabled`）可通过 OAuth 回调、Token 刷新或会话绕过登录的漏洞；禁止通过重置密码将 `deviceOnly` 扫码配对账号静默升级为标准账号；限制 `pairingRestricted` 设备调用 `register-owned-role`。
+- **并发与定时器可靠性**：
+  - `Store.register` 增加按账号互斥锁（`regLocks`），`PairingManager.hostConfirm` 增加按会话互斥锁（`confirmLocks`）并改为顺序注册，彻底消除配额上限竞态绕过。
+  - `PairingManager.createSession` 增加 512 活跃会话上限并调度 `alarm()` 回收；`alarm()` 新增 `lastPingAt` 判断，避免高频唤醒误覆盖心跳 `nonce` 导致设备误断线，并接入 `processPendingOffline` 与无 WebSocket 时的持续过期清理。
+  - 改密接口合并重复路由并自动重建当前会话下发 `Set-Cookie`，修复改密后立即 401 掉线的问题；修复 OAuth 扫码成功 HTML 页乱码与黑白名单保存越权问题。
+- **Webhook SSRF 防护增强**：`checkUrl()` 完整解析 IPv6 8 段字面量，拦截 `::`/`::1`、ULA、链路本地、组播以及 IPv4-compatible、IPv4-mapped、6to4、NAT64 等内网映射地址，禁用重定向并设置 7 秒超时。
+- **前后端错误规范与 UI 修复**：统一所有 API 异常信封（含 `requestId` 与 `retryable`）并对齐 40+ 个中文错误码说明；修复系统设置页 Hook 顺序导致的白屏问题、深浅主题下悬浮条/Toast 对比度、复选框对齐与移动端导航遮挡问题。
+
+### 优化
+
+- **Durable Object 存储与性能**：新增 `devtok:<deviceId>` 设备令牌索引消除 `invalidate` 与 `deleteAccount` 的全表扫描；全部 `storage.delete` 批量操作按 128 key 分片；`useData` 在页面隐藏时跳过轮询且遇到 401 自动停止。
+- **前端工程整理**：将 `web/src/` 重构为 `lib/`、`components/`、`pages/` 清晰目录，统一卡片化列表、全选/半选批量栏与 `Modal` 二次确认弹窗，去除全部原生 `alert`/`confirm`/`prompt`。
+
+### 文档
+
+- 新增 `v1.0.2` 变更记录，更新 `README.md` 架构说明与全部 12 个后台页面截图预览。
+
 ## v1.0.1 (2026-11-18)
 
 P2P / STUN 连接控制与卡片化后台管理重构：新增「打开 P2P」与「打开 STUN」双默认开启开关，内置完整 18 条公共 STUN 列表，并将 STUN 与 Origin 白名单管理全部升级为可添加、删除、单条禁用的卡片界面。
